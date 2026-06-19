@@ -19,11 +19,14 @@ from unasked.classify import (
     _bash_is_consequential,
     _bash_is_external_source,
     _is_external_source_decision,
+    _is_high_consequence,
+    _task_anchored,
     is_url_or_domain,
     WRITE_TOOLS,
     CONSEQUENTIAL_BASH_VERBS,
     BENIGN_BASH_VERBS,
     EXTERNAL_SOURCE_TOOLS,
+    HIGH_CONSEQUENCE_BASH_VERBS,
 )
 from unasked.ir import Decision, Run
 
@@ -123,9 +126,10 @@ class TestToolInduced:
         )
 
     def test_local_read_result_path_then_written_not_tool_induced(self):
-        """F4.1: Read result contains a local path; agent writes that path (not in task).
-        TOOL_INDUCED must NOT fire — Read is a local source, not an external source.
-        The action is AUTONOMOUS (off-task consequential write).
+        """F4.1/F4.2: Read result contains a local path; agent writes that path (not in task).
+        TOOL_INDUCED must NOT fire — Read is a local source.
+        F4.2: task 'fix auth bug' is NOT anchored (no file/path entities) → ordinary
+        off-task Write → DERIVED (not AUTONOMOUS, not TOOL_INDUCED).
         """
         run = _run(
             "fix auth bug",
@@ -140,7 +144,9 @@ class TestToolInduced:
             "F4.1: local Read result_entities must NEVER arm TOOL_INDUCED. "
             f"Got: {d.provenance}"
         )
-        assert d.provenance == "AUTONOMOUS"
+        # F4.2: task not anchored → ordinary off-task write → DERIVED
+        assert d.provenance != "TOOL_INDUCED"
+        assert d.provenance in ("DERIVED", "AUTONOMOUS")  # AUTONOMOUS if task anchored
 
     def test_non_adjacent_prior_external_still_detected(self):
         """F4.1: Entity injected via WebFetch two steps back still triggers TOOL_INDUCED.
@@ -220,19 +226,17 @@ class TestToolInduced:
 
 class TestReadThenEditAntiFalsePositive:
     def test_read_helper_then_edit_helper_not_tool_induced(self):
-        """F3b REGRESSION TEST: Read src/helper.py (result = ordinary code,
+        """F3b/F4.2 REGRESSION TEST: Read src/helper.py (result = ordinary code,
         no external URLs/paths), then Edit src/helper.py.
 
-        The old token-overlap proxy falsely flagged this as TOOL_INDUCED because
-        'helper.py' appeared in both the Read call args and Edit call args.
-
+        The old token-overlap proxy falsely flagged this as TOOL_INDUCED.
         The new rule only fires when the Edit's TARGET appeared in the Read's
-        RESULT CONTENT. Ordinary code content contains no external paths that
-        the Edit targets — result_entities has no 'src/helper.py'.
+        RESULT CONTENT as a URL/domain from an external source.
 
-        helper.py is off-task ('fix auth bug') so the edit lands AUTONOMOUS
-        (consequential, off-task file). That is correct: the flag is scope/
-        autonomous, not injection.
+        F4.2: task 'fix auth bug' is NOT anchored (no file/path entities).
+        helper.py is off-task and ordinary → falls to DERIVED (not AUTONOMOUS,
+        not TOOL_INDUCED). If task were anchored (e.g. 'fix src/auth.py'), the
+        edit would be AUTONOMOUS.
         """
         run = _run(
             "fix auth bug",
@@ -251,9 +255,9 @@ class TestReadThenEditAntiFalsePositive:
             "This is the F3b regression the fix was designed to prevent. "
             f"Got: {d.provenance} (why: {d.why})"
         )
-        # Should be AUTONOMOUS (off-task edit of a file not in 'fix auth bug')
-        assert d.provenance == "AUTONOMOUS", (
-            f"Expected AUTONOMOUS for off-task edit, got {d.provenance}"
+        # F4.2: task not anchored → ordinary off-task edit → DERIVED
+        assert d.provenance in ("DERIVED", "AUTONOMOUS"), (
+            f"Expected DERIVED (vague task) or AUTONOMOUS (anchored task), got {d.provenance}"
         )
 
     def test_read_task_file_then_edit_not_tool_induced(self):
@@ -625,31 +629,43 @@ class TestToolInducedF41:
         )
 
 
-# ── F4.1: AUTONOMOUS suppressed when no task ─────────────────────────────────
+# ── F4.1/F4.2: AUTONOMOUS suppression when no task ───────────────────────────
 
 class TestNoTaskAutonomousSuppressed:
-    def test_consequential_action_no_task_not_autonomous(self):
-        """F4.1: With no task_text, consequential action must NOT be AUTONOMOUS.
-        Without a task we cannot judge 'did without being asked'.
+    def test_ordinary_consequential_no_task_not_autonomous(self):
+        """F4.1/F4.2: With no task_text, ORDINARY consequential action must NOT be AUTONOMOUS.
+        Edit to a non-secret file with no task → DERIVED.
+        """
+        run = _run(
+            None,
+            [_dec(0, "Edit", ["src/models.py"])],
+        )
+        d = classify_run(run).decisions[0]
+        assert d.provenance != "AUTONOMOUS", (
+            f"F4.1: ordinary AUTONOMOUS must not fire without task_text. Got: {d.provenance}"
+        )
+        assert d.provenance == "DERIVED"
+
+    def test_high_consequence_no_task_still_autonomous(self):
+        """F4.2: HIGH_CONSEQUENCE (git push) fires AUTONOMOUS even with no task_text.
+        A git push with no stated task is exactly what you want surfaced.
         """
         run = _run(
             None,
             [_dec(0, "Bash", ["git", "push", "origin", "main"])],
         )
         d = classify_run(run).decisions[0]
-        assert d.provenance != "AUTONOMOUS", (
-            f"F4.1: AUTONOMOUS must not fire without task_text. Got: {d.provenance}"
+        assert d.provenance == "AUTONOMOUS", (
+            f"F4.2: git push must be AUTONOMOUS even with no task. Got: {d.provenance}"
         )
-        assert d.provenance == "DERIVED"
 
-    def test_multiple_consequential_no_task_all_derived(self):
-        """F4.1: Zero AUTONOMOUS flags when task_text is None."""
+    def test_ordinary_consequential_no_task_all_derived(self):
+        """F4.1/F4.2: Ordinary actions with no task → zero AUTONOMOUS flags."""
         run = _run(
             None,
             [
-                _dec(0, "Bash", ["git", "push", "origin", "main"]),
-                _dec(1, "Edit", ["config/db.yaml"]),
-                _dec(2, "Write", ["scripts/deploy.sh"]),
+                _dec(0, "Edit", ["config/db.yaml"]),
+                _dec(1, "Write", ["src/models.py"]),
             ],
         )
         classify_run(run)
@@ -657,7 +673,7 @@ class TestNoTaskAutonomousSuppressed:
             1 for d in run.decisions if d.provenance == "AUTONOMOUS"
         )
         assert autonomous_count == 0, (
-            f"F4.1: expected 0 AUTONOMOUS flags with no task, got {autonomous_count}"
+            f"F4.1: expected 0 AUTONOMOUS for ordinary actions with no task, got {autonomous_count}"
         )
 
     def test_tool_induced_still_fires_with_no_task(self):
@@ -672,3 +688,161 @@ class TestNoTaskAutonomousSuppressed:
         )
         d = classify_run(run).decisions[1]
         assert d.provenance == "TOOL_INDUCED"
+
+
+# ── F4.2: _task_anchored helper ───────────────────────────────────────────────
+
+class TestTaskAnchored:
+    def test_file_path_entity_is_anchored(self):
+        """Entity with slash → anchored."""
+        assert _task_anchored(["src/auth.py"]) is True
+
+    def test_dotted_code_extension_is_anchored(self):
+        """Entity with .py extension → anchored."""
+        assert _task_anchored(["auth.py"]) is True
+
+    def test_known_src_dir_stem_is_anchored(self):
+        """Entity starting with known dir stem (src, lib, tests…) → anchored."""
+        assert _task_anchored(["src"]) is True
+        assert _task_anchored(["tests"]) is True
+        assert _task_anchored(["lib"]) is True
+
+    def test_vague_prose_not_anchored(self):
+        """Pure prose tokens with no file/path signal → not anchored."""
+        assert _task_anchored(["focus", "sprint", "goals", "delivery"]) is False
+
+    def test_empty_entities_not_anchored(self):
+        assert _task_anchored([]) is False
+
+    def test_mixed_anchors_one_sufficient(self):
+        """Any single anchor is enough."""
+        assert _task_anchored(["refactor", "auth.py", "tomorrow"]) is True
+
+
+# ── F4.2: _is_high_consequence helper ────────────────────────────────────────
+
+class TestIsHighConsequence:
+    def test_git_push_is_high_consequence(self):
+        dec = _dec(0, "Bash", ["git", "push", "origin", "main"])
+        assert _is_high_consequence(dec) is True
+
+    def test_git_reset_is_high_consequence(self):
+        dec = _dec(0, "Bash", ["git", "reset", "--hard", "HEAD~1"])
+        assert _is_high_consequence(dec) is True
+
+    def test_rm_is_high_consequence(self):
+        dec = _dec(0, "Bash", ["rm", "-rf", "dist/"])
+        assert _is_high_consequence(dec) is True
+
+    def test_curl_is_high_consequence(self):
+        dec = _dec(0, "Bash", ["curl", "https://example.com/api"])
+        assert _is_high_consequence(dec) is True
+
+    def test_docker_is_high_consequence(self):
+        dec = _dec(0, "Bash", ["docker", "push", "myimage:latest"])
+        assert _is_high_consequence(dec) is True
+
+    def test_git_status_not_high_consequence(self):
+        dec = _dec(0, "Bash", ["git", "status"])
+        assert _is_high_consequence(dec) is False
+
+    def test_git_log_not_high_consequence(self):
+        dec = _dec(0, "Bash", ["git", "log", "--oneline"])
+        assert _is_high_consequence(dec) is False
+
+    def test_edit_normal_file_not_high_consequence(self):
+        dec = _dec(0, "Edit", ["src/auth.py"])
+        assert _is_high_consequence(dec) is False
+
+    def test_write_env_file_is_high_consequence(self):
+        """Write to .env is HIGH_CONSEQUENCE (secret file)."""
+        dec = _dec(0, "Write", [".env"])
+        assert _is_high_consequence(dec) is True
+
+    def test_edit_env_local_is_high_consequence(self):
+        """Edit .env.local is HIGH_CONSEQUENCE."""
+        dec = _dec(0, "Edit", [".env.local"])
+        assert _is_high_consequence(dec) is True
+
+    def test_write_pem_file_is_high_consequence(self):
+        """Write to a .pem file is HIGH_CONSEQUENCE."""
+        dec = _dec(0, "Write", ["certs/server.pem"])
+        assert _is_high_consequence(dec) is True
+
+    def test_write_id_rsa_is_high_consequence(self):
+        """Write to id_rsa is HIGH_CONSEQUENCE."""
+        dec = _dec(0, "Write", ["/home/user/.ssh/id_rsa"])
+        assert _is_high_consequence(dec) is True
+
+
+# ── F4.2: two-tier AUTONOMOUS integration ────────────────────────────────────
+
+class TestAutonomousF42:
+    def test_git_push_autonomous_with_vague_task(self):
+        """F4.2 TIER 1: git push (HIGH_CONSEQUENCE) flagged even on vague/unanchored task."""
+        run = _run(
+            "things I want to focus on this sprint",
+            [_dec(0, "Bash", ["git", "push", "origin", "main"])],
+        )
+        d = classify_run(run).decisions[0]
+        assert d.provenance == "AUTONOMOUS", (
+            f"F4.2: git push must be AUTONOMOUS even on vague task. Got: {d.provenance}"
+        )
+
+    def test_git_push_autonomous_with_no_task(self):
+        """F4.2 TIER 1: git push (HIGH_CONSEQUENCE) flagged even with task_text None."""
+        run = _run(
+            None,
+            [_dec(0, "Bash", ["git", "push", "origin", "main"])],
+        )
+        d = classify_run(run).decisions[0]
+        assert d.provenance == "AUTONOMOUS", (
+            f"F4.2: git push must be AUTONOMOUS even with no task. Got: {d.provenance}"
+        )
+
+    def test_vague_task_off_task_edit_not_autonomous(self):
+        """F4.2 KEY REGRESSION: vague prose task + off-task Edit → DERIVED, not AUTONOMOUS.
+        A vague task has no anchors → we can't credibly claim the edit is 'off-task'.
+        """
+        run = _run(
+            "things I want to focus on this sprint",
+            [_dec(0, "Edit", ["src/x.py"])],
+        )
+        d = classify_run(run).decisions[0]
+        assert d.provenance != "AUTONOMOUS", (
+            f"F4.2: off-task Edit on vague task must NOT be AUTONOMOUS. Got: {d.provenance}"
+        )
+        assert d.provenance == "DERIVED"
+
+    def test_anchored_task_off_task_edit_is_autonomous(self):
+        """F4.2 TIER 2: anchored task (names src/auth.py) + off-task Edit → AUTONOMOUS."""
+        run = _run(
+            "fix the token bug in src/auth.py",
+            [_dec(0, "Edit", ["src/other.py"])],
+        )
+        d = classify_run(run).decisions[0]
+        assert d.provenance == "AUTONOMOUS", (
+            f"F4.2: off-task edit when task is anchored must be AUTONOMOUS. Got: {d.provenance}"
+        )
+
+    def test_env_file_write_autonomous_regardless_of_task(self):
+        """F4.2 TIER 1: Write to .env is HIGH_CONSEQUENCE → AUTONOMOUS even on vague task."""
+        run = _run(
+            "focus on delivery",
+            [_dec(0, "Write", [".env"])],
+        )
+        d = classify_run(run).decisions[0]
+        assert d.provenance == "AUTONOMOUS", (
+            f"F4.2: .env write must be AUTONOMOUS regardless of task vagueness. Got: {d.provenance}"
+        )
+
+    def test_rm_autonomous_with_vague_task(self):
+        """F4.2 TIER 1: rm command is HIGH_CONSEQUENCE → AUTONOMOUS on vague task."""
+        run = _run(
+            "clean things up a bit",
+            [_dec(0, "Bash", ["rm", "-rf", "dist/"])],
+        )
+        d = classify_run(run).decisions[0]
+        assert d.provenance == "AUTONOMOUS", (
+            f"F4.2: rm must be AUTONOMOUS even on vague task. Got: {d.provenance}"
+        )

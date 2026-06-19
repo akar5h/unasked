@@ -489,9 +489,10 @@ class TestTaskExtractionSkipsArtifacts:
 
 
 class TestNoTaskRenderAndClassify:
-    def test_no_task_zero_autonomous_from_transcript(self, tmp_path):
-        """F4.1: session with only slash-command artifacts → task_text None
-        → zero AUTONOMOUS flags after classification.
+    def test_no_task_ordinary_action_zero_autonomous_from_transcript(self, tmp_path):
+        """F4.1/F4.2: session with only slash-command artifacts → task_text None.
+        Ordinary consequential action (Edit to non-secret file) → zero AUTONOMOUS flags.
+        (HIGH_CONSEQUENCE actions like git push still fire — tested separately.)
         """
         from unasked.classify import classify_run
 
@@ -501,8 +502,8 @@ class TestNoTaskRenderAndClassify:
                          "content": "<command-name>/clear</command-name>"}},
             {"type": "assistant", "timestamp": "2026-06-18T08:00:01.000Z",
              "message": {"role": "assistant", "content": [
-                 {"type": "tool_use", "id": "toolu_n01", "name": "Bash",
-                  "input": {"command": "git push origin main"}},
+                 {"type": "tool_use", "id": "toolu_n01", "name": "Edit",
+                  "input": {"file_path": "src/models.py", "old_string": "x", "new_string": "y"}},
              ]}},
             {"type": "user", "timestamp": "2026-06-18T08:00:02.000Z",
              "message": {"role": "user", "content": [
@@ -517,7 +518,8 @@ class TestNoTaskRenderAndClassify:
         classify_run(run)
         autonomous = [d for d in run.decisions if d.provenance == "AUTONOMOUS"]
         assert len(autonomous) == 0, (
-            f"F4.1: expected 0 AUTONOMOUS flags with no task, got {len(autonomous)}"
+            f"F4.1/F4.2: expected 0 AUTONOMOUS flags for ordinary action with no task, "
+            f"got {len(autonomous)}"
         )
 
     def test_no_task_render_shows_detected_message(self, tmp_path):

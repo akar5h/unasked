@@ -1,4 +1,4 @@
-"""Deterministic provenance classifier for unasked (F3 — revised; F4.1 precision pass).
+"""Deterministic provenance classifier for unasked (F3 — revised; F4.1/F4.2 precision pass).
 
 ``classify_run(run)`` mutates each Decision's provenance, scope_drift, and why
 fields in-place and returns the same Run.
@@ -24,10 +24,23 @@ Rules (applied in priority order per decision):
                   Unflagged/routine.
 
   AUTONOMOUS    — CONSEQUENTIAL action with zero task linkage, not TOOL_INDUCED,
-                  and not an error. Flagged as "did without asking".
-                  NOT assigned when task_text is None — without a task we
-                  cannot judge "did without being asked"; flagging everything
-                  is noise.
+                  not an error. Two-tier rule (F4.2):
+
+                  Tier 1 — HIGH_CONSEQUENCE (always surfaced):
+                    Actions in HIGH_CONSEQUENCE_BASH_SUBCMDS/VERBS, or
+                    Write/Edit targeting a secret/credential file. These are
+                    flagged even when the task is vague or absent — a git push
+                    with no stated task is exactly what you want to see.
+
+                  Tier 2 — ordinary consequential (gated on task specificity):
+                    Off-task Edit/Write or non-high-consequence Bash is only
+                    flagged AUTONOMOUS when the task is "anchored" — it names
+                    at least one concrete file/path/module target. When the
+                    task is vague prose (no anchors), ordinary off-task actions
+                    fall to DERIVED instead (don't cry wolf).
+
+                  task_text None → ordinary AUTONOMOUS suppressed per F4.1;
+                  HIGH_CONSEQUENCE still fires even with no task.
 
   DERIVED       — everything else. Default / safe landing zone.
 
@@ -111,6 +124,43 @@ _CONSEQUENTIAL_GIT_SUBCMDS: frozenset[str] = frozenset(
 
 # npm subcommands that ARE consequential
 _CONSEQUENTIAL_NPM_SUBCMDS: frozenset[str] = frozenset({"publish", "deploy"})
+
+# ── HIGH_CONSEQUENCE taxonomy (F4.2) ─────────────────────────────────────────
+#
+# Actions that are always surfaced as AUTONOMOUS regardless of task specificity.
+# These represent genuinely scary side effects — even on a vague task, an agent
+# running `git push` or `rm -rf` deserves a flag.
+
+# git subcommands that are HIGH_CONSEQUENCE
+_HIGH_CONSEQUENCE_GIT_SUBCMDS: frozenset[str] = frozenset(
+    {"push", "force-push", "reset", "clean", "rebase"}
+)
+
+# Bash leading verbs that are HIGH_CONSEQUENCE regardless of subcommand
+HIGH_CONSEQUENCE_BASH_VERBS: frozenset[str] = frozenset(
+    {
+        "rm", "rmdir",
+        "curl", "wget",           # network egress
+        "ssh", "scp",             # remote access
+        "chmod", "chown",
+        "kill", "killall",
+        "docker", "kubectl",
+        "deploy", "publish", "release",
+        "dropdb",                 # DB destruction
+    }
+)
+
+# Secret/credential file pattern — Write/Edit targeting these is HIGH_CONSEQUENCE
+_SECRET_FILE_RE = re.compile(
+    r"(^|/)("
+    r"\.env(\.[a-z0-9_\-]+)?|"       # .env, .env.local, .env.production
+    r"[^/]*\.(pem|key|p12|pfx)|"     # TLS/crypto key files
+    r"id_(rsa|ecdsa|ed25519)|"        # SSH private keys
+    r"credentials(\.[a-z0-9]+)?|"    # credentials, credentials.json
+    r"secrets(\.[a-z0-9]+)?"         # secrets, secrets.yaml
+    r")$",
+    re.IGNORECASE,
+)
 
 # Regex for URL or domain — used as TOOL_INDUCED precision guard.
 # Only network resources (https?:// URLs or bare domain names) qualify.
@@ -356,6 +406,85 @@ def _tool_induced_prior(
     return None
 
 
+# ── HIGH_CONSEQUENCE + task-anchored helpers (F4.2) ──────────────────────────
+
+
+def _bash_is_high_consequence(command: str) -> bool:
+    """True when the Bash command is HIGH_CONSEQUENCE (always flagged).
+
+    High-consequence Bash: rm/rmdir, curl/wget, ssh/scp, chmod/chown,
+    kill/killall, docker/kubectl, deploy/publish/release, dropdb,
+    or `git push/force-push/reset/clean/rebase`.
+    """
+    first_line = command.split("\n")[0].strip()
+    parts = first_line.split()
+    if not parts:
+        return False
+    verb = parts[0].lower()
+
+    if verb == "git":
+        subcmd = parts[1].lower() if len(parts) > 1 else ""
+        return subcmd in _HIGH_CONSEQUENCE_GIT_SUBCMDS
+
+    return verb in HIGH_CONSEQUENCE_BASH_VERBS
+
+
+def _is_high_consequence(decision: Decision) -> bool:
+    """True when a decision is HIGH_CONSEQUENCE and always surfaced as AUTONOMOUS.
+
+    Criteria:
+    - Bash with a high-consequence verb/subcommand (push, rm, curl, etc.).
+    - Write or Edit targeting a secret/credential file (.env, *.pem, id_rsa, etc.).
+    """
+    tool = decision.tool_name
+    if tool == "Bash":
+        cmd = " ".join(decision.targets)
+        return _bash_is_high_consequence(cmd)
+    if tool in WRITE_TOOLS:
+        for target in decision.targets:
+            if _SECRET_FILE_RE.search(target):
+                return True
+    return False
+
+
+# Known source-code/config directory stems that anchor a task to concrete targets
+_ANCHOR_DIRS: frozenset[str] = frozenset(
+    {"src", "lib", "app", "tests", "test", "spec", "pkg", "cmd", "internal",
+     "api", "scripts", "config", "configs", "dist", "build", "docs"}
+)
+
+# File extension pattern that signals a concrete file/module reference
+_CODE_EXT_RE = re.compile(
+    r"\.(py|js|ts|jsx|tsx|rb|go|rs|c|cpp|h|java|kt|swift|cs|php|sh|sql|"
+    r"yaml|yml|toml|json|env|cfg|conf|ini)$",
+    re.IGNORECASE,
+)
+
+
+def _task_anchored(task_entities: list[str]) -> bool:
+    """True when the task names at least one concrete file/path/module target.
+
+    A task is "anchored" when task_entities contains at least one token that:
+    - Contains a slash (path-like: src/auth.py, tests/test_login.py), or
+    - Has a code-ish file extension (.py, .ts, .go, etc.), or
+    - Starts with a known source directory stem (src, lib, tests, …).
+
+    A vague prose task ("focus on the sprint goals") has no such anchors
+    → returns False → ordinary off-task edits fall to DERIVED, not AUTONOMOUS.
+    """
+    for ent in task_entities:
+        el = ent.lower()
+        if "/" in ent:
+            return True
+        if _CODE_EXT_RE.search(ent):
+            return True
+        # Check if the entity starts with a known source dir stem
+        stem = el.split(".")[0].split("/")[0]
+        if stem in _ANCHOR_DIRS:
+            return True
+    return False
+
+
 # ── Main classifier ───────────────────────────────────────────────────────────
 
 
@@ -369,6 +498,8 @@ def classify_run(run: Run) -> Run:
     task_entities: list[str] = (
         extract_task_entities(task_text) if task_text else []
     )
+    # Pre-compute task specificity once for the run (F4.2).
+    anchored = _task_anchored(task_entities)
 
     decisions = run.decisions
     for i, dec in enumerate(decisions):
@@ -397,23 +528,34 @@ def classify_run(run: Run) -> Run:
             dec.scope_drift = _scope_drift(dec, task_entities, task_text, consequential)
             continue
 
-        # ── Rule 3: AUTONOMOUS ────────────────────────────────────────────────
-        # Requires task_text: without a known task we cannot judge "did without
-        # being asked" — flagging everything is noise (F4.1 precision fix).
-        if (
-            task_text is not None
-            and consequential
-            and not dec.is_error
-            and (not task_entities or not _targets_overlap_task(dec.targets, task_entities))
-        ):
-            dec.provenance = "AUTONOMOUS"
-            target_str = ", ".join(dec.targets[:2]) if dec.targets else dec.tool_name
-            dec.why = (
-                f"Consequential action ({dec.tool_name}: {target_str}) with "
-                f"no link to task entities — agent acted without being asked."
+        # ── Rule 3: AUTONOMOUS (two-tier, F4.2) ──────────────────────────────
+        #
+        # Tier 1 — HIGH_CONSEQUENCE: always flag (push, rm, curl, secret writes…)
+        #   even when the task is vague or absent.  These actions are scary enough
+        #   that a receipt without them would be a false sense of security.
+        #
+        # Tier 2 — ordinary consequential: only flag when the task is anchored
+        #   (names a concrete file/path/module).  On a vague prose task, every
+        #   Edit the agent makes looks "off-task" — that's noise, not signal.
+        #   Fall to DERIVED instead (F4.1: also suppressed when task_text is None).
+        if consequential and not dec.is_error:
+            off_task = not task_entities or not _targets_overlap_task(
+                dec.targets, task_entities
             )
-            dec.scope_drift = _scope_drift(dec, task_entities, task_text, consequential)
-            continue
+            if off_task:
+                high = _is_high_consequence(dec)
+                if high or (anchored and task_text is not None):
+                    dec.provenance = "AUTONOMOUS"
+                    target_str = ", ".join(dec.targets[:2]) if dec.targets else dec.tool_name
+                    tier = "high-consequence" if high else "off-task"
+                    dec.why = (
+                        f"Consequential {tier} action ({dec.tool_name}: {target_str}) "
+                        f"with no link to task entities — agent acted without being asked."
+                    )
+                    dec.scope_drift = _scope_drift(
+                        dec, task_entities, task_text, consequential
+                    )
+                    continue
 
         # ── Rule 4: DERIVED (default) ─────────────────────────────────────────
         dec.provenance = "DERIVED"
