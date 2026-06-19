@@ -34,6 +34,14 @@ class Decision:
         step_index of the causal parent decision (e.g. the LLM call that
         produced this tool call). None when no parent is known or applicable.
 
+    Entity fields (populated by the adapter):
+
+    result_entities : list[str]
+        Redacted URLs, domains, and file paths extracted from THIS decision's
+        tool_result content.  Raw result text is never stored.  Used by the
+        classifier to detect TOOL_INDUCED steps (the agent acted on something
+        that originated from a prior tool's output, not from the user).
+
     Provenance / classification fields (populated by later features):
 
     provenance : str | None
@@ -52,6 +60,15 @@ class Decision:
     ts: str | None
     tool_name: str
     tool_args_summary: str
+    # Entity fields — populated by the adapter.
+    # targets: redacted identifying entities this action operates on (file paths,
+    # command verbs, URLs).  Extracted from tool_input at parse time.
+    targets: list[str] = field(default_factory=list)
+    # result_entities: redacted URLs, domains, and file paths found in THIS
+    # decision's tool_result content.  Raw result text is never stored — only
+    # the extracted, redacted entity strings.  Used by the classifier to detect
+    # TOOL_INDUCED decisions (agent acted on something from a prior tool output).
+    result_entities: list[str] = field(default_factory=list)
     is_error: bool = False
     parent_step_index: int | None = None
     # Provenance fields — populated by later features, nullable by design.

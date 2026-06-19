@@ -14,6 +14,7 @@ touch the real home database.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -57,6 +58,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     ts                TEXT,
     tool_name         TEXT,
     args_summary      TEXT,
+    targets           TEXT,
+    result_entities   TEXT,
     parent_step_index INTEGER,
     provenance        TEXT,
     scope_drift       INTEGER,
@@ -65,6 +68,12 @@ CREATE TABLE IF NOT EXISTS decisions (
     FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
 """
+
+# Migration statements for existing databases that predate targets/result_entities columns.
+_MIGRATIONS = [
+    "ALTER TABLE decisions ADD COLUMN targets TEXT",
+    "ALTER TABLE decisions ADD COLUMN result_entities TEXT",
+]
 
 _DDL_IDX_DECISIONS = """
 CREATE INDEX IF NOT EXISTS idx_decisions_run_id ON decisions(run_id);
@@ -86,6 +95,12 @@ def init_db(path: str | Path | None = None) -> sqlite3.Connection:
     conn.execute(_DDL_RUNS)
     conn.execute(_DDL_DECISIONS)
     conn.execute(_DDL_IDX_DECISIONS)
+    # Idempotent migrations for pre-existing databases
+    for migration in _MIGRATIONS:
+        try:
+            conn.execute(migration)
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.commit()
     return conn
 
@@ -123,8 +138,9 @@ def save_run(run: Run, path: str | Path | None = None) -> None:
                 """
                 INSERT INTO decisions
                     (run_id, step_index, ts, tool_name, args_summary,
+                     targets, result_entities,
                      parent_step_index, provenance, scope_drift, why, feedback)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -133,6 +149,8 @@ def save_run(run: Run, path: str | Path | None = None) -> None:
                         d.ts,
                         d.tool_name,
                         d.tool_args_summary,
+                        json.dumps(d.targets),
+                        json.dumps(d.result_entities),
                         d.parent_step_index,
                         d.provenance,
                         int(d.scope_drift) if d.scope_drift is not None else None,
@@ -165,6 +183,7 @@ def load_run(run_id: str, path: str | Path | None = None) -> Run | None:
         dcur = conn.execute(
             """
             SELECT step_index, ts, tool_name, args_summary,
+                   targets, result_entities,
                    parent_step_index, provenance, scope_drift, why, feedback
             FROM decisions
             WHERE run_id = ?
@@ -178,11 +197,13 @@ def load_run(run_id: str, path: str | Path | None = None) -> Run | None:
                 ts=r[1],
                 tool_name=r[2],
                 tool_args_summary=r[3],
-                parent_step_index=r[4],
-                provenance=r[5],
-                scope_drift=bool(r[6]) if r[6] is not None else None,
-                why=r[7],
-                feedback=r[8],
+                targets=json.loads(r[4] or "[]"),
+                result_entities=json.loads(r[5] or "[]"),
+                parent_step_index=r[6],
+                provenance=r[7],
+                scope_drift=bool(r[8]) if r[8] is not None else None,
+                why=r[9],
+                feedback=r[10],
             )
             for r in dcur.fetchall()
         ]
