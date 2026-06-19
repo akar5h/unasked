@@ -1,0 +1,10 @@
+__pycache__/
+.venv/
+*.db
+.kairos/
+.env
+.env.*
+.pytest_cache/
+*.egg-info/
+build/
+dist/
