@@ -846,3 +846,67 @@ class TestAutonomousF42:
         assert d.provenance == "AUTONOMOUS", (
             f"F4.2: rm must be AUTONOMOUS even on vague task. Got: {d.provenance}"
         )
+
+
+# ── F4.3: scope_drift gated on task anchoring ─────────────────────────────────
+
+class TestScopeDriftF43:
+    def test_anchored_task_off_scope_edit_scope_drift_true(self):
+        """F4.3 preserved: anchored task + off-scope consequential edit → scope_drift True."""
+        run = _run(
+            "fix src/auth.py token expiry",
+            [_dec(0, "Edit", ["config/db.yaml"])],
+        )
+        d = classify_run(run).decisions[0]
+        assert d.scope_drift is True, (
+            f"Anchored task + off-scope edit must have scope_drift True. Got: {d.scope_drift}"
+        )
+
+    def test_vague_task_off_scope_edit_scope_drift_false(self):
+        """F4.3 KEY: vague/unanchored task + off-scope edit → scope_drift False.
+        Without concrete task targets there is no definable scope.
+        """
+        run = _run(
+            "focus on delivery this sprint",
+            [_dec(0, "Edit", ["config/db.yaml"])],
+        )
+        d = classify_run(run).decisions[0]
+        assert d.scope_drift is False, (
+            f"F4.3: vague task must never produce scope_drift True. Got: {d.scope_drift}"
+        )
+
+    def test_no_task_scope_drift_none(self):
+        """task_text None → scope_drift None (unchanged from prior behavior)."""
+        run = _run(
+            None,
+            [_dec(0, "Edit", ["config/db.yaml"])],
+        )
+        d = classify_run(run).decisions[0]
+        assert d.scope_drift is None, (
+            f"No task → scope_drift must be None. Got: {d.scope_drift}"
+        )
+
+    def test_anchored_task_in_scope_edit_scope_drift_false(self):
+        """Anchored task + in-scope edit → scope_drift False (unchanged)."""
+        run = _run(
+            "fix src/auth.py token expiry",
+            [_dec(0, "Edit", ["src/auth.py"])],
+        )
+        d = classify_run(run).decisions[0]
+        assert d.scope_drift is False
+
+    def test_vague_task_many_off_scope_edits_all_false(self):
+        """F4.3: all off-scope edits on vague task → zero scope_drift flags."""
+        run = _run(
+            "make things better",
+            [
+                _dec(0, "Edit", ["src/models.py"]),
+                _dec(1, "Write", ["docs/plan.md"]),
+                _dec(2, "Edit", ["config/settings.yaml"]),
+            ],
+        )
+        classify_run(run)
+        drifted = [d for d in run.decisions if d.scope_drift is True]
+        assert len(drifted) == 0, (
+            f"F4.3: expected 0 scope_drift True on vague task, got {len(drifted)}"
+        )

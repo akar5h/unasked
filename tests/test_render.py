@@ -535,3 +535,29 @@ class TestGoldenSnapshot:
         assert "⚡" in receipt
         # Verdict present
         assert "verdict:" in receipt
+
+
+# ── F4.3: render note for unanchored tasks ────────────────────────────────────
+
+
+class TestUnanchoredNote:
+    def test_vague_task_shows_note(self):
+        """F4.3: vague/unanchored task_text → render includes 'task not concrete' note."""
+        receipt = _classified(
+            "focus on delivery this sprint",
+            [_dec(0, "Edit", ["src/models.py"])],
+        )
+        assert "task not concrete" in receipt
+
+    def test_anchored_task_no_note(self):
+        """F4.3: anchored task (names a file) → no 'task not concrete' note."""
+        receipt = _classified(
+            "fix src/auth.py token expiry",
+            [_dec(0, "Edit", ["src/auth.py"])],
+        )
+        assert "task not concrete" not in receipt
+
+    def test_no_task_shows_note(self):
+        """F4.3: task_text None → also shows 'task not concrete' note."""
+        receipt = _classified(None, [_dec(0, "Read", ["auth.py"])])
+        assert "task not concrete" in receipt

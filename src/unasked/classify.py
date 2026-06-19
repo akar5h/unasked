@@ -255,11 +255,18 @@ def _scope_drift(
     """Compute scope_drift for a decision.
 
     None  → task_text absent
-    True  → consequential, path target outside task scope
-    False → otherwise
+    True  → consequential, path target outside task scope, AND task is anchored
+    False → otherwise (including when task is vague/unanchored — F4.3)
+
+    F4.3: scope_drift may be True ONLY when _task_anchored() is True.
+    Without a concrete task (named files/paths/modules) there is no definable
+    scope; claiming an action is "out of scope" would be dishonest noise.
     """
     if task_text is None:
         return None
+    # F4.3: no concrete task anchor → no definable scope → never True
+    if not _task_anchored(task_entities):
+        return False
     if not is_consequential:
         return False
 

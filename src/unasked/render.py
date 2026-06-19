@@ -35,6 +35,8 @@ import re
 from datetime import datetime, timezone
 from typing import Sequence
 
+from unasked.classify import _task_anchored
+from unasked.entities import extract_task_entities
 from unasked.ir import Decision, Run
 
 # ── ANSI helpers ──────────────────────────────────────────────────────────────
@@ -132,6 +134,13 @@ def render_receipt(run: Run, *, color: bool = True) -> str:
     # make that visible so the user knows provenance for AUTONOMOUS was not assessed.
     task_part = _trunc(run.task_text or "(no explicit task detected)", 80)
     lines.append(f'run {rid} — {step_part} · task: "{task_part}"')
+    # F4.3: note when task is not concrete so user knows scope checks were limited.
+    task_entities = extract_task_entities(run.task_text) if run.task_text else []
+    if not _task_anchored(task_entities):
+        lines.append(
+            "note: task not concrete — scope/off-task checks limited; "
+            "showing injection + high-consequence only."
+        )
     lines.append("")
 
     # ── Bucket decisions ──────────────────────────────────────────────────────
