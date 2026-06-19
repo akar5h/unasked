@@ -128,7 +128,9 @@ def render_receipt(run: Run, *, color: bool = True) -> str:
     n = len(run.decisions)
     dur = _duration_str(run)
     step_part = f"{n} steps" + (f", {dur}" if dur else "")
-    task_part = _trunc(run.task_text or "(no task captured)", 80)
+    # When task_text is None, AUTONOMOUS was suppressed (F4.1 precision fix) —
+    # make that visible so the user knows provenance for AUTONOMOUS was not assessed.
+    task_part = _trunc(run.task_text or "(no explicit task detected)", 80)
     lines.append(f'run {rid} — {step_part} · task: "{task_part}"')
     lines.append("")
 

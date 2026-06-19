@@ -142,6 +142,38 @@ def _is_pure_tool_result(content: Any) -> bool:
     )
 
 
+# Tags injected by CC into user messages that signal a slash-command artifact
+# or hook/system injection rather than a real human instruction.
+_COMMAND_ARTIFACT_TAGS = (
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<local-command-",
+)
+
+
+def _is_command_artifact(text: str) -> bool:
+    """True when text is a slash-command artifact or hook/system injection.
+
+    These messages are injected by Claude Code itself and do not represent
+    real human task instructions.  Patterns detected:
+    - Text starting with a slash command: ``/clear``, ``/model``, etc.
+    - Text containing CC command XML tags: <command-name>, <command-message>,
+      <command-args>, or any <local-command-*> tag.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return True  # empty — not a real instruction
+    # Slash-command prefix: /word (e.g. /clear, /model, /compact)
+    if stripped.startswith("/") and len(stripped) > 1 and stripped[1:2].isalpha():
+        return True
+    # CC-injected command/hook XML tags
+    for tag in _COMMAND_ARTIFACT_TAGS:
+        if tag in stripped:
+            return True
+    return False
+
+
 # ── Main parser ───────────────────────────────────────────────────────────────
 
 
@@ -200,9 +232,14 @@ def load_session(source: str) -> Run:
                 if tid:
                     tool_results[tid] = block
 
-    # Extract task_text from the first non-empty, non-tool-result, non-isMeta
-    # user message.  isMeta lines are internal CC metadata injected at session
-    # start (caveman hook output, skill listings, etc.) — not the user's task.
+    # Extract task_text from the first real human instruction.  Scan user
+    # messages in order; skip a message when it is:
+    #   - isMeta (CC internal metadata)
+    #   - tool_result-only
+    #   - empty
+    #   - a command artifact (slash-command or CC hook/system injection)
+    # If no real instruction is found, task_text remains None — the classifier
+    # will suppress AUTONOMOUS in that case (F4.1 precision fix).
     task_text: str | None = None
     for rec in records:
         if rec.get("type") != "user":
@@ -213,9 +250,12 @@ def load_session(source: str) -> Run:
         if _is_pure_tool_result(content):
             continue
         text = _extract_text_content(content)
-        if text:
-            task_text = text
-            break
+        if not text:
+            continue
+        if _is_command_artifact(text):
+            continue
+        task_text = text
+        break
 
     # Walk assistant messages and collect tool_use blocks as Decisions.
     decisions: list[Decision] = []
@@ -391,7 +431,7 @@ def read_session_from_spool(
                                 content = entry.get("message", {}).get("content")
                                 if not _is_pure_tool_result(content):
                                     text = _extract_text_content(content)
-                                    if text:
+                                    if text and not _is_command_artifact(text):
                                         task_text = text
                                         break
                     except (OSError, json.JSONDecodeError, UnicodeDecodeError):

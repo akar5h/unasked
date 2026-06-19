@@ -97,8 +97,9 @@ class TestHeader:
         assert "…" in receipt
 
     def test_no_task_placeholder(self):
+        """F4.1: when task_text is None, render shows the 'no explicit task detected' message."""
         receipt = _classified(None, [_dec(0, "Read", ["auth.py"])])
-        assert "no task captured" in receipt
+        assert "no explicit task detected" in receipt
 
     def test_no_duration_when_no_timestamps(self):
         """Without started_at or decision ts, duration is omitted."""

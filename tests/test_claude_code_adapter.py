@@ -11,7 +11,11 @@ from pathlib import Path
 
 import pytest
 
-from unasked.adapters.claude_code import ingest_session, load_session
+from unasked.adapters.claude_code import (
+    ingest_session,
+    load_session,
+    _is_command_artifact,
+)
 from unasked.ir import Run
 from unasked.redact import redact, summarize_args
 
@@ -368,3 +372,168 @@ class TestRedact:
         summary = run.decisions[0].tool_args_summary
         assert "[REDACTED]" in summary
         assert secret_val not in summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F4.1: _is_command_artifact helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestIsCommandArtifact:
+    def test_slash_clear_is_artifact(self):
+        assert _is_command_artifact("/clear") is True
+
+    def test_slash_model_is_artifact(self):
+        assert _is_command_artifact("/model") is True
+
+    def test_slash_command_with_content_is_artifact(self):
+        # e.g. "/compact summarise the session"
+        assert _is_command_artifact("/compact summarise the session") is True
+
+    def test_command_name_tag_is_artifact(self):
+        text = "<command-name>/clear</command-name>"
+        assert _is_command_artifact(text) is True
+
+    def test_command_message_tag_is_artifact(self):
+        text = "<command-message>some message</command-message>"
+        assert _is_command_artifact(text) is True
+
+    def test_command_args_tag_is_artifact(self):
+        text = "<command-args>--verbose</command-args>"
+        assert _is_command_artifact(text) is True
+
+    def test_local_command_tag_is_artifact(self):
+        text = "<local-command-output>some hook output</local-command-output>"
+        assert _is_command_artifact(text) is True
+
+    def test_real_instruction_not_artifact(self):
+        assert _is_command_artifact("Fix the failing auth test in src/auth.py") is False
+
+    def test_empty_string_is_artifact(self):
+        assert _is_command_artifact("") is True
+
+    def test_whitespace_only_is_artifact(self):
+        assert _is_command_artifact("   ") is True
+
+    def test_normal_sentence_starting_with_word_not_artifact(self):
+        assert _is_command_artifact("Please update the config file") is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F4.1: task extraction skips command artifacts
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestTaskExtractionSkipsArtifacts:
+    def _make_transcript(self, tmp_path, lines):
+        path = tmp_path / "test-session.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+        return str(path)
+
+    def test_skips_slash_clear_finds_real_instruction(self, tmp_path):
+        """F4.1: first message is /clear artifact; second is real instruction.
+        task_text must be the real instruction, not the artifact.
+        """
+        lines = [
+            {"type": "user", "timestamp": "2026-06-18T08:00:00.000Z",
+             "message": {"role": "user",
+                         "content": "<command-name>/clear</command-name>"}},
+            {"type": "user", "timestamp": "2026-06-18T08:00:01.000Z",
+             "message": {"role": "user",
+                         "content": "Fix the failing auth test in src/auth.py"}},
+            {"type": "assistant", "timestamp": "2026-06-18T08:00:02.000Z",
+             "message": {"role": "assistant", "content": [
+                 {"type": "tool_use", "id": "toolu_x01", "name": "Read",
+                  "input": {"file_path": "src/auth.py"}}
+             ]}},
+        ]
+        run = load_session(self._make_transcript(tmp_path, lines))
+        assert run.task_text == "Fix the failing auth test in src/auth.py"
+
+    def test_skips_slash_model_finds_real_instruction(self, tmp_path):
+        """F4.1: first message is /model artifact; real instruction follows."""
+        lines = [
+            {"type": "user", "timestamp": "2026-06-18T08:00:00.000Z",
+             "message": {"role": "user", "content": "/model"}},
+            {"type": "user", "timestamp": "2026-06-18T08:00:01.000Z",
+             "message": {"role": "user", "content": "Refactor the database module"}},
+        ]
+        run = load_session(self._make_transcript(tmp_path, lines))
+        assert run.task_text == "Refactor the database module"
+
+    def test_only_artifacts_returns_none(self, tmp_path):
+        """F4.1: when all user messages are artifacts, task_text must be None."""
+        lines = [
+            {"type": "user", "timestamp": "2026-06-18T08:00:00.000Z",
+             "message": {"role": "user",
+                         "content": "<command-name>/clear</command-name>"}},
+            {"type": "user", "timestamp": "2026-06-18T08:00:01.000Z",
+             "message": {"role": "user", "content": "/compact"}},
+        ]
+        run = load_session(self._make_transcript(tmp_path, lines))
+        assert run.task_text is None
+
+    def test_normal_first_message_still_captured(self, tmp_path):
+        """Regression: normal first user message is still captured as task_text."""
+        lines = [
+            {"type": "user", "timestamp": "2026-06-18T08:00:00.000Z",
+             "message": {"role": "user", "content": "Add unit tests for the parser"}},
+        ]
+        run = load_session(self._make_transcript(tmp_path, lines))
+        assert run.task_text == "Add unit tests for the parser"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F4.1: no-task run → zero AUTONOMOUS flags; render shows detection message
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestNoTaskRenderAndClassify:
+    def test_no_task_zero_autonomous_from_transcript(self, tmp_path):
+        """F4.1: session with only slash-command artifacts → task_text None
+        → zero AUTONOMOUS flags after classification.
+        """
+        from unasked.classify import classify_run
+
+        lines = [
+            {"type": "user", "timestamp": "2026-06-18T08:00:00.000Z",
+             "message": {"role": "user",
+                         "content": "<command-name>/clear</command-name>"}},
+            {"type": "assistant", "timestamp": "2026-06-18T08:00:01.000Z",
+             "message": {"role": "assistant", "content": [
+                 {"type": "tool_use", "id": "toolu_n01", "name": "Bash",
+                  "input": {"command": "git push origin main"}},
+             ]}},
+            {"type": "user", "timestamp": "2026-06-18T08:00:02.000Z",
+             "message": {"role": "user", "content": [
+                 {"type": "tool_result", "tool_use_id": "toolu_n01", "content": "ok"}
+             ]}},
+        ]
+        path = tmp_path / "notask-session.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        run = load_session(str(path))
+        assert run.task_text is None
+        classify_run(run)
+        autonomous = [d for d in run.decisions if d.provenance == "AUTONOMOUS"]
+        assert len(autonomous) == 0, (
+            f"F4.1: expected 0 AUTONOMOUS flags with no task, got {len(autonomous)}"
+        )
+
+    def test_no_task_render_shows_detected_message(self, tmp_path):
+        """F4.1: render shows '(no explicit task detected)' when task_text is None."""
+        from unasked.classify import classify_run
+        from unasked.render import render_receipt
+
+        lines = [
+            {"type": "user", "timestamp": "2026-06-18T08:00:00.000Z",
+             "message": {"role": "user",
+                         "content": "<command-name>/clear</command-name>"}},
+        ]
+        path = tmp_path / "notask2-session.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        run = load_session(str(path))
+        classify_run(run)
+        receipt = render_receipt(run, color=False)
+        assert "no explicit task detected" in receipt
