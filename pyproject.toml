@@ -9,6 +9,9 @@ description = "See what your agent did without being asked — a local receipt o
 requires-python = ">=3.12"
 dependencies = []
 
+[project.scripts]
+unasked = "unasked.cli:main"
+
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 
