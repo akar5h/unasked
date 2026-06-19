@@ -1,0 +1,1 @@
+# unasked adapters package
