@@ -1,24 +1,39 @@
-"""Claude Code transcript adapter for unasked.
+"""Claude Code adapters for unasked.
 
-Reads a Claude Code session transcript (``~/.claude/projects/**/<id>.jsonl``)
-and converts it into the unasked IR: a ``Run`` with one ``Decision`` per
-``tool_use`` content block emitted by the assistant.
+Two source paths:
 
-Transcript format (one JSON line per record):
+PRIMARY — native transcript reader (``load_session``)
+    Reads ``~/.claude/projects/**/<session_id>.jsonl`` directly.  Works on
+    any existing CC session with ZERO setup — no hook required.
+
+SECONDARY — spool reader (``read_session_from_spool``)
+    Reads ``~/.kairos/spool/<session_id>.jsonl`` written by kairos_hook.py.
+    Opt-in capture-time path; only available after the hook is installed.
+    Already-redacted by the hook; a second redaction pass is applied anyway.
+
+``ingest_session(source, db_path, source_kind)`` is the persist wrapper.
+Set ``source_kind="spool"`` to use the spool path; default is ``"transcript"``.
+
+──────────────────────────────────────────────────────────────────────────────
+Native transcript format (one JSON line per record):
   - ``type == "user"``      — user message; may contain ``tool_result`` blocks
   - ``type == "assistant"`` — assistant message; may contain ``tool_use`` blocks
-  - Other types (queue-operation, attachment, …) — skipped
+  - Other types (queue-operation, attachment, isMeta, …) — skipped
 
 Each record:
   {
     "type": "user" | "assistant" | ...,
+    "uuid": "...",
+    "parentUuid": "...",
+    "isMeta": bool | absent,          # metadata lines — skipped for task_text
     "timestamp": "2026-06-04T22:44:07.123Z",
     "sessionId": "f367ec06-...",
     "message": {
       "role": "user" | "assistant",
       "content": str | [
         {"type": "tool_use",    "id": "toolu_...", "name": "...", "input": {...}},
-        {"type": "tool_result", "tool_use_id": "toolu_...", "is_error": bool, ...},
+        {"type": "tool_result", "tool_use_id": "toolu_...", "content": ...,
+         "is_error": bool},           # is_error often absent → default False
         {"type": "text", "text": "..."},
         ...
       ]
@@ -27,39 +42,49 @@ Each record:
 
 Parsing rules
 -------------
-- ``task_text``: first user message whose content is non-empty text (str or
-  joined text blocks). Cap at 500 chars. Tool-result-only messages skipped.
+- ``task_text``: first ``user`` message that is NOT a tool_result-only message
+  AND NOT an isMeta line. Joined text blocks, capped at 500 chars.
 - ``Decision`` per ``tool_use`` block (assistant messages only). Step index is
   0-based over the whole session in order of occurrence.
-- ``is_error``: resolved by matching the immediately-following user message's
-  ``tool_result`` block whose ``tool_use_id`` == this tool_use ``id``.
-  Default False when no matching result found.
-- ``parent_step_index``: sequential — each decision's parent is the previous
-  one (index - 1), None for the first. Simple causal chain; no uuid graph.
+- ``is_error``: resolved by matching ``tool_result.tool_use_id == tool_use.id``.
+  Default False when absent.
+- ``parent_step_index``: sequential (index - 1), None for the first decision.
 - ``started_at``: timestamp of the first record in the file.
-- ``run_id``: the session UUID (filename stem).
-- Malformed / unparseable lines are silently skipped (mirror live_normalizer).
+- ``run_id``: filename stem.
+- Malformed / unparseable lines are silently skipped (soft-fail).
 
-Path resolution for ``load_session(source)``
---------------------------------------------
-  - If ``source`` is an existing file path → use it directly.
-  - Otherwise treat as a session_id and glob
-    ``~/.claude/projects/**/<session_id>.jsonl``, take first match.
-  - Raises ``FileNotFoundError`` when nothing is found.
+──────────────────────────────────────────────────────────────────────────────
+Spool format (written by kairos_hook.py, one JSON line per event):
+  {
+    "session_id": "...",
+    "event_name": "SessionStart" | "PostToolUse" | "PostToolUseFailure" | "SessionEnd",
+    "tool_name": str | null,
+    "tool_input_redacted": dict | null,   # already redacted by the hook
+    "is_error": bool | null,
+    "occurred_at": "2026-06-18T...",
+    "payload_redacted": {...}             # may carry "transcript_path"
+  }
+
+Spool path resolution (``read_session_from_spool``):
+  1. Explicit ``spool_dir`` argument.
+  2. ``KAIROS_SPOOL_DIR`` env var.
+  3. Default: ``~/.kairos/spool``.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 from unasked.ir import Decision, Run
 from unasked.ledger import save_run
-from unasked.redact import summarize_args
+from unasked.redact import redact, summarize_args
 
-# Default projects root under which CC stores transcripts.
+# Default roots.
 _PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+_DEFAULT_SPOOL_ROOT = Path.home() / ".kairos" / "spool"
 
 
 # ── Path resolution ───────────────────────────────────────────────────────────
@@ -174,10 +199,14 @@ def load_session(source: str) -> Run:
                 if tid:
                     tool_results[tid] = block
 
-    # Extract task_text from the first non-empty, non-tool-result user message.
+    # Extract task_text from the first non-empty, non-tool-result, non-isMeta
+    # user message.  isMeta lines are internal CC metadata injected at session
+    # start (caveman hook output, skill listings, etc.) — not the user's task.
     task_text: str | None = None
     for rec in records:
         if rec.get("type") != "user":
+            continue
+        if rec.get("isMeta"):
             continue
         content = rec.get("message", {}).get("content")
         if _is_pure_tool_result(content):
@@ -235,25 +264,149 @@ def load_session(source: str) -> Run:
     )
 
 
-def ingest_session(source: str, db_path: str | None = None) -> Run:
-    """Load a transcript and persist it to the ledger in one call.
-
-    ``load_session`` is pure (returns Run, no side effects). This thin wrapper
-    adds the ``save_run`` call for callers that want load + persist together.
+def ingest_session(
+    source: str,
+    db_path: str | None = None,
+    source_kind: str = "transcript",
+) -> Run:
+    """Load a session and persist it to the ledger in one call.
 
     Parameters
     ----------
     source:
-        File path or session UUID — passed through to ``load_session``.
+        File path or session UUID.
     db_path:
         Override ledger DB path. Falls back to ``UNASKED_LEDGER_DB`` env or
         ``~/.kairos/ledger.db``.
+    source_kind:
+        ``"transcript"`` (default) — reads the native CC transcript via
+        ``load_session``; works on any existing session with zero setup.
+        ``"spool"`` — reads the kairos hook spool via
+        ``read_session_from_spool``; requires the hook to be installed.
 
     Returns
     -------
     Run
         The same ``Run`` that was persisted.
     """
-    run = load_session(source)
+    if source_kind == "spool":
+        run = read_session_from_spool(source)
+    else:
+        run = load_session(source)
     save_run(run, path=db_path)
     return run
+
+
+# ── Spool reader (opt-in, capture-time path) ──────────────────────────────────
+
+
+def _spool_path(session_id: str, spool_dir: str | Path | None) -> Path:
+    if spool_dir is not None:
+        root = Path(spool_dir)
+    else:
+        override = os.environ.get("KAIROS_SPOOL_DIR", "").strip()
+        root = Path(override) if override else _DEFAULT_SPOOL_ROOT
+    return root / f"{session_id}.jsonl"
+
+
+def read_session_from_spool(
+    session_id: str,
+    spool_dir: str | Path | None = None,
+) -> Run:
+    """Read a Claude Code spool JSONL (written by kairos_hook.py) → ``Run``.
+
+    This is the OPT-IN capture-time path.  It only works after kairos_hook.py
+    is installed.  Prefer ``load_session`` for zero-setup reading of existing
+    CC session history.
+
+    Parameters
+    ----------
+    session_id:
+        The session UUID — matches the spool filename stem.
+    spool_dir:
+        Override the spool root directory.  Falls back to ``KAIROS_SPOOL_DIR``
+        env var, then ``~/.kairos/spool``.
+
+    Raises
+    ------
+    FileNotFoundError
+        When no spool file exists for that session_id.
+    """
+    spool_file = _spool_path(session_id, spool_dir)
+    if not spool_file.exists():
+        raise FileNotFoundError(
+            f"No spool file for session {session_id!r}: {spool_file}"
+        )
+
+    raw_lines = spool_file.read_text(encoding="utf-8").splitlines()
+
+    started_at: str | None = None
+    task_text: str | None = None
+    decisions: list[Decision] = []
+
+    for line in raw_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event: dict[str, Any] = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # soft-fail
+
+        name = event.get("event_name", "")
+
+        if name == "SessionStart":
+            started_at = event.get("occurred_at")
+            # Best-effort task_text from transcript_path if present.
+            if task_text is None:
+                tp = (event.get("payload_redacted") or {}).get("transcript_path")
+                if tp:
+                    tp_path = Path(str(tp))
+                    try:
+                        for tline in tp_path.read_text(encoding="utf-8").splitlines():
+                            tline = tline.strip()
+                            if not tline:
+                                continue
+                            entry = json.loads(tline)
+                            if entry.get("type") == "user" and not entry.get("isMeta"):
+                                content = entry.get("message", {}).get("content")
+                                if not _is_pure_tool_result(content):
+                                    text = _extract_text_content(content)
+                                    if text:
+                                        task_text = text
+                                        break
+                    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+
+        elif name in ("PostToolUse", "PostToolUseFailure"):
+            tool_name = str(event.get("tool_name") or "unknown")
+            args: dict[str, Any] = event.get("tool_input_redacted") or {}
+            # args are already redacted by kairos_hook.py; one more pass is safe.
+            raw_summary = summarize_args(tool_name, args)
+            args_summary = redact(raw_summary)
+
+            is_error_raw = event.get("is_error")
+            is_error = bool(is_error_raw) or name == "PostToolUseFailure"
+
+            step_index = len(decisions)
+            parent = step_index - 1 if step_index > 0 else None
+
+            decisions.append(
+                Decision(
+                    step_index=step_index,
+                    ts=event.get("occurred_at"),
+                    tool_name=tool_name,
+                    tool_args_summary=args_summary,
+                    is_error=is_error,
+                    parent_step_index=parent,
+                )
+            )
+        # SessionEnd: no IR equivalent — ignored.
+
+    return Run(
+        run_id=session_id,
+        source="claude_code",
+        task_text=task_text,
+        started_at=started_at,
+        decisions=decisions,
+    )
