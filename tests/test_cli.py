@@ -28,7 +28,8 @@ import pytest
 # ── Subprocess helpers ────────────────────────────────────────────────────────
 
 _UNASKED = ["uv", "run", "unasked"]
-_CWD = "/Users/akarshgajbhiye/unasked"
+# Repo root, derived from this file's location (no hardcoded machine paths).
+_CWD = str(Path(__file__).resolve().parent.parent)
 
 
 def _run_cli(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
