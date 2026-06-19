@@ -193,6 +193,7 @@ def _classify_one(
     prior: Decision | None,
     task_text: str | None,
     task_tokens: frozenset[str],
+    all_prior: Sequence[Decision] | None = None,
 ) -> tuple[str, str]:
     """Return (provenance_label, why) for one decision.
 
@@ -202,20 +203,26 @@ def _classify_one(
     summary = decision.tool_args_summary
 
     # ── TOOL_INDUCED ─────────────────────────────────────────────────────────
-    # Condition: prior step was a READ-class tool AND current tool/target has
-    # no direct token overlap with the task but does share tokens with the
-    # prior step's summary (suggesting the agent acted on what it just read).
-    if (
-        prior is not None
-        and prior.tool_name in _READ_TOOLS
-        and not _overlap(summary, task_text or "")
-        and _overlap(summary, prior.tool_args_summary)
-    ):
-        return (
-            "TOOL_INDUCED",
-            f"Action follows a {prior.tool_name} call and targets content "
-            f"not stated in the task (shares tokens with prior step's args).",
-        )
+    # Condition: D's resource/target matches an entity that appeared in a PRIOR
+    # decision's result_entities (the agent acted on something a tool returned),
+    # AND that entity is NOT present in task_text (not user-requested).
+    #
+    # We scan all prior steps' result_entities, not just the immediately prior
+    # one — an agent can act on injected content several steps later.
+    if all_prior:
+        resource = _extract_resource(summary) or summary
+        for prev in all_prior:
+            for entity in prev.result_entities:
+                # Entity must appear in the current decision's target/summary.
+                if not entity or len(entity) < 3:
+                    continue
+                if _overlap(resource, entity) and not _overlap(entity, task_text or ""):
+                    return (
+                        "TOOL_INDUCED",
+                        f"Action targets '{entity}' which originated from the "
+                        f"output of step {prev.step_index} ({prev.tool_name}), "
+                        f"not from the task.",
+                    )
 
     # ── AUTONOMOUS ────────────────────────────────────────────────────────────
     # Condition: write/execute/delegate/comms tool whose target isn't in the
@@ -301,7 +308,8 @@ def classify(run: Run) -> Run:
             continue
 
         prior = decisions[i - 1] if i > 0 else None
-        label, why = _classify_one(dec, prior, task_text or None, task_tokens)
+        all_prior = decisions[:i] if i > 0 else []
+        label, why = _classify_one(dec, prior, task_text or None, task_tokens, all_prior)
 
         dec.provenance = label
         dec.why = why

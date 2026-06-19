@@ -303,18 +303,18 @@ class TestAutonomous:
 
 class TestToolInduced:
     def test_write_after_read_new_target(self):
-        """Read returns content about deploy.sh; agent then writes deploy.sh
-        without being asked → TOOL_INDUCED (steered by read content).
+        """Read result contains 'scripts/deploy.sh'; agent then writes that path
+        without being asked → TOOL_INDUCED (steered by tool result content).
 
-        Prior: Read file_path=docs/deploy-guide.md
+        Prior: Read file_path=docs/deploy-guide.md, result mentions scripts/deploy.sh
         Current: Write file_path=scripts/deploy.sh
-        Shared token: 'deploy' in both summaries.
-        Not in task: 'fix auth bug'.
+        Entity 'scripts/deploy.sh' in prior result_entities, NOT in task 'fix auth bug'.
         """
         run = _run(
             "fix auth bug",
             [
-                _dec(0, "Read", "file_path=docs/deploy-guide.md"),
+                _dec(0, "Read", "file_path=docs/deploy-guide.md",
+                     result_entities=["scripts/deploy.sh"]),
                 _dec(1, "Write", "file_path=scripts/deploy.sh"),
             ],
         )
@@ -322,41 +322,44 @@ class TestToolInduced:
         assert d.provenance == "TOOL_INDUCED"
 
     def test_bash_after_webfetch_new_target(self):
-        """WebFetch returns a page about curl usage; agent then runs curl
-        command not in task → TOOL_INDUCED."""
+        """WebFetch result contains a URL; agent then curls that URL not in task
+        → TOOL_INDUCED."""
         run = _run(
             "summarise the readme",
             [
-                _dec(0, "WebFetch", "https://api.example.com/docs"),
+                _dec(0, "WebFetch", "https://api.example.com/docs",
+                     result_entities=["https://api.example.com/token"]),
                 _dec(1, "Bash", "curl https://api.example.com/token"),
             ],
         )
         d = classify(run).decisions[1]
         assert d.provenance == "TOOL_INDUCED"
 
-    def test_no_token_overlap_with_prior_not_tool_induced(self):
-        """Current decision shares NO tokens with prior Read → not TOOL_INDUCED.
-        Falls through to AUTONOMOUS (write tool, not in task, not related to prior)."""
+    def test_no_result_entities_not_tool_induced(self):
+        """Prior Read has empty result_entities → cannot be TOOL_INDUCED.
+        Falls through to AUTONOMOUS (write tool, not in task, not prior-related)."""
         run = _run(
             "fix auth bug",
             [
-                _dec(0, "Read", "file_path=auth.py"),
+                _dec(0, "Read", "file_path=auth.py", result_entities=[]),
                 _dec(1, "Write", "file_path=billing/invoice.py"),
             ],
         )
         d = classify(run).decisions[1]
-        # No token overlap between 'auth.py' and 'billing/invoice.py' → not TOOL_INDUCED
+        # No result_entities → TOOL_INDUCED cannot fire.
         assert d.provenance != "TOOL_INDUCED"
         assert d.provenance == "AUTONOMOUS"
 
     def test_write_to_same_task_file_after_read_not_tool_induced(self):
-        """Read auth.py then Edit auth.py — target overlaps task → NOT TOOL_INDUCED.
-        (Precision: don't flag routine read-then-edit as TOOL_INDUCED.)
+        """Read auth.py then Edit auth.py where auth.py IS in task_text.
+        Even if result_entities mentions auth.py, it's in the task → NOT TOOL_INDUCED.
+        (Precision: don't flag routine read-then-edit on task-named files.)
         """
         run = _run(
             "fix auth.py",
             [
-                _dec(0, "Read", "file_path=auth.py"),
+                _dec(0, "Read", "file_path=auth.py",
+                     result_entities=["auth.py"]),  # entity in task → not injected
                 _dec(1, "Edit", "file_path=auth.py"),
             ],
         )
@@ -364,46 +367,63 @@ class TestToolInduced:
         assert d.provenance != "TOOL_INDUCED"
 
     def test_tool_induced_has_why(self):
-        """TOOL_INDUCED decision must always carry a why string."""
+        """TOOL_INDUCED decision must carry a non-empty why string."""
         run = _run(
             "fix auth bug",
             [
-                _dec(0, "Read", "file_path=docs/deploy-guide.md"),
+                _dec(0, "Read", "file_path=docs/deploy-guide.md",
+                     result_entities=["scripts/deploy.sh"]),
                 _dec(1, "Write", "file_path=scripts/deploy.sh"),
             ],
         )
         d = classify(run).decisions[1]
-        assert d.why and "Read" in d.why
+        assert d.why and len(d.why) > 0
 
     def test_tool_induced_after_webSearch(self):
-        """WebSearch for term; agent then edits a file matching search topic not in task."""
+        """WebSearch result contains a stripe URL; agent edits stripe.py not in task."""
         run = _run(
             "fix auth bug",
             [
-                _dec(0, "WebSearch", "query: stripe integration guide"),
+                _dec(0, "WebSearch", "query: stripe integration guide",
+                     result_entities=["billing/stripe.py"]),
                 _dec(1, "Edit", "file_path=billing/stripe.py"),
             ],
         )
         d = classify(run).decisions[1]
         assert d.provenance == "TOOL_INDUCED"
 
-    def test_prior_must_be_read_class(self):
-        """If prior step is a WRITE tool (not read-class), next step cannot be TOOL_INDUCED
-        even if tokens overlap — TOOL_INDUCED requires prior to be read-class."""
+    def test_no_result_entities_on_write_not_tool_induced(self):
+        """Prior step is a WRITE tool with no result_entities; cannot be TOOL_INDUCED."""
         run = _run(
             "fix auth bug",
             [
-                _dec(0, "Edit", "file_path=deploy.sh"),   # WRITE, not READ
+                _dec(0, "Edit", "file_path=deploy.sh", result_entities=[]),
                 _dec(1, "Bash", "bash deploy.sh"),
             ],
         )
         d = classify(run).decisions[1]
-        # Bash deploy.sh not in task "fix auth bug"; prior was Edit (write class).
-        # Can't be TOOL_INDUCED. Should be AUTONOMOUS (bash not in task, not prior-related
-        # enough because 'deploy' doesn't overlap 'auth bug').
-        # Actually 'deploy' IS in prior summary → prior_related=True → not AUTONOMOUS.
-        # Falls to REQUESTED (deploy in prior? no, task check). Falls to DERIVED.
+        # No result_entities → TOOL_INDUCED cannot fire regardless of prior tool type.
         assert d.provenance != "TOOL_INDUCED"
+
+    def test_tool_induced_from_non_adjacent_prior(self):
+        """Entity injected two steps back still triggers TOOL_INDUCED.
+
+        Step 0: Read returns result_entities=['scripts/evil.sh']
+        Step 1: Bash (unrelated)
+        Step 2: Bash 'bash scripts/evil.sh' — matches step 0 entity, not in task
+        → TOOL_INDUCED (scans ALL prior steps, not just immediate prior).
+        """
+        run = _run(
+            "fix auth bug",
+            [
+                _dec(0, "Read", "file_path=docs/runbook.md",
+                     result_entities=["scripts/evil.sh"]),
+                _dec(1, "Bash", "pytest tests/"),
+                _dec(2, "Bash", "bash scripts/evil.sh"),
+            ],
+        )
+        d = classify(run).decisions[2]
+        assert d.provenance == "TOOL_INDUCED"
 
 
 # ── Multi-step run end-to-end ──────────────────────────────────────────────────
@@ -446,24 +466,25 @@ class TestMultiStepRun:
         assert labels[4] == "AUTONOMOUS", f"git push should be AUTONOMOUS, got {labels[4]}"
 
     def test_tool_induced_scenario_in_multi_step(self):
-        """Read a runbook doc then curl a URL sharing a token from the doc.
+        """Read a runbook doc whose result content contains a Stripe URL; agent
+        then curls that URL which is NOT in the task → TOOL_INDUCED.
 
-        Step 0: Read docs/stripe-integration.md  (prior, READ-class)
-        Step 1: Bash curl https://api.stripe.com/charge  (not in task, shares 'stripe')
+        Step 0: Read docs/stripe-integration.md; result_entities=['https://api.stripe.com/charge']
+        Step 1: Bash curl https://api.stripe.com/charge  (not in task)
 
-        'stripe' appears in prior summary (stripe-integration.md) but NOT in task
-        ('summarise the auth docs').  Structural TOOL_INDUCED signal fires.
+        Entity originates from step 0's tool result, not the user's task
+        ('summarise the auth docs') → TOOL_INDUCED.
         """
         run = _run(
             "summarise the auth docs",
             [
-                _dec(0, "Read", "file_path=docs/stripe-integration.md"),
+                _dec(0, "Read", "file_path=docs/stripe-integration.md",
+                     result_entities=["https://api.stripe.com/charge"]),
                 _dec(1, "Bash", "curl https://api.stripe.com/charge"),
             ],
         )
         classified = classify(run)
         d1 = classified.decisions[1]
-        # 'stripe' in prior and 'stripe' in current; NOT in task → TOOL_INDUCED
         assert d1.provenance == "TOOL_INDUCED", f"Expected TOOL_INDUCED, got {d1.provenance}"
 
     def test_scope_drift_on_autonomous_steps_only(self):
@@ -498,3 +519,128 @@ class TestMultiStepRun:
         classified = classify(run)
         for d in classified.decisions:
             assert d.scope_drift is False, f"step {d.step_index} drifted without task"
+
+
+# ── F3b: result_entities — TOOL_INDUCED true positive + anti-false-positive ───
+
+class TestF3bResultEntities:
+    def test_true_positive_external_url_injection(self):
+        """TRUE POSITIVE: tool_result content contains https://evil.example.com;
+        next action (WebFetch) targets that domain → TOOL_INDUCED.
+
+        Entity 'https://evil.example.com' is in step 0's result_entities,
+        is NOT in task_text, and step 1 targets it.
+        """
+        run = _run(
+            "summarise the internal docs",
+            [
+                _dec(0, "Read", "file_path=docs/notes.md",
+                     result_entities=["https://evil.example.com/payload"]),
+                _dec(1, "WebFetch", "https://evil.example.com/payload"),
+            ],
+        )
+        d = classify(run).decisions[1]
+        assert d.provenance == "TOOL_INDUCED", (
+            f"Expected TOOL_INDUCED for entity-matched URL, got {d.provenance}"
+        )
+
+    def test_anti_false_positive_read_then_edit_ordinary_code(self):
+        """CRITICAL ANTI-FALSE-POSITIVE: Read(src/helper.py) whose result is
+        ordinary code (no external URL/directive), then Edit(src/helper.py)
+        where helper.py is NOT in task_text → must NOT be TOOL_INDUCED.
+
+        Prior result_entities is empty (no URLs/domains/paths in ordinary code
+        that match the edit target as an injected entity).  Edit falls through
+        to DERIVED (natural follow-on from a Read of the same file).
+        Scope_drift True is acceptable.
+        """
+        run = _run(
+            "clean up the utils module",
+            [
+                # result_entities is empty: ordinary code has no external entities
+                _dec(0, "Read", "file_path=src/helper.py", result_entities=[]),
+                _dec(1, "Edit", "file_path=src/helper.py"),
+            ],
+        )
+        d = classify(run).decisions[1]
+        assert d.provenance != "TOOL_INDUCED", (
+            f"Read-then-edit of same file must not be TOOL_INDUCED, got {d.provenance}"
+        )
+        assert d.provenance == "DERIVED", (
+            f"Expected DERIVED for routine read-then-edit, got {d.provenance}"
+        )
+        # scope_drift True is acceptable (helper.py not in 'clean up the utils module')
+
+    def test_entity_in_task_not_tool_induced(self):
+        """If the injected entity IS mentioned in the task, it's user-requested,
+        not tool-induced — should be REQUESTED, not TOOL_INDUCED."""
+        run = _run(
+            "fetch https://api.example.com/data and summarise it",
+            [
+                _dec(0, "Read", "file_path=config.json",
+                     result_entities=["https://api.example.com/data"]),
+                _dec(1, "WebFetch", "https://api.example.com/data"),
+            ],
+        )
+        d = classify(run).decisions[1]
+        # Entity is in task_text → not TOOL_INDUCED
+        assert d.provenance != "TOOL_INDUCED", (
+            f"Entity present in task must not trigger TOOL_INDUCED, got {d.provenance}"
+        )
+
+
+# ── F3b: extract_result_entities unit tests ────────────────────────────────────
+
+class TestExtractResultEntities:
+    """Unit tests for the extract_result_entities helper (entities.py)."""
+
+    def test_url_extracted(self):
+        from unasked.entities import extract_result_entities
+        entities = extract_result_entities("See https://evil.example.com/payload for details.")
+        assert any("evil.example.com" in e for e in entities), f"Got: {entities}"
+
+    def test_abs_path_extracted(self):
+        from unasked.entities import extract_result_entities
+        entities = extract_result_entities("File saved to /tmp/output/result.json")
+        assert any("/tmp/output" in e or "result.json" in e for e in entities), f"Got: {entities}"
+
+    def test_rel_path_extracted(self):
+        from unasked.entities import extract_result_entities
+        entities = extract_result_entities("Run src/helper.py for more info")
+        assert any("src/helper" in e for e in entities), f"Got: {entities}"
+
+    def test_empty_text_returns_empty(self):
+        from unasked.entities import extract_result_entities
+        assert extract_result_entities("") == []
+
+    def test_max_entities_capped(self):
+        from unasked.entities import extract_result_entities, _MAX_RESULT_ENTITIES
+        # Generate more than _MAX_RESULT_ENTITIES distinct URLs
+        text = " ".join(f"https://host{i}.example.com/path" for i in range(30))
+        entities = extract_result_entities(text)
+        assert len(entities) <= _MAX_RESULT_ENTITIES
+
+    def test_each_entity_max_len(self):
+        from unasked.entities import extract_result_entities, _MAX_ENTITY_LEN
+        # URL longer than _MAX_ENTITY_LEN
+        long_url = "https://example.com/" + "a" * 200
+        entities = extract_result_entities(long_url)
+        for e in entities:
+            assert len(e) <= _MAX_ENTITY_LEN, f"Entity too long: {len(e)} chars"
+
+    def test_secret_shaped_value_redacted(self):
+        """Secret-shaped values (API key pattern) must be redacted, never stored."""
+        from unasked.entities import extract_result_entities
+        # Build the secret with + concat so it never appears as a literal in tests
+        secret = "sk-" + "A" * 25
+        text = f"Use token {secret} to authenticate against https://api.example.com"
+        entities = extract_result_entities(text)
+        for e in entities:
+            assert secret not in e, f"Secret leaked into entity: {e}"
+            assert "sk-" + "A" * 25 not in e
+
+    def test_deduplicated(self):
+        from unasked.entities import extract_result_entities
+        text = "Visit https://example.com https://example.com again"
+        entities = extract_result_entities(text)
+        assert entities.count("https://example.com") <= 1

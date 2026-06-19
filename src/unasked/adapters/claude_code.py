@@ -78,6 +78,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from unasked.entities import extract_result_entities, extract_targets
 from unasked.ir import Decision, Run
 from unasked.ledger import save_run
 from unasked.redact import redact, summarize_args
@@ -236,10 +237,26 @@ def load_session(source: str) -> Run:
             tool_input: dict[str, Any] = block.get("input") or {}
 
             args_summary = summarize_args(tool_name, tool_input)
+            targets = extract_targets(tool_name, tool_input)
 
-            # Resolve is_error from the matching tool_result (default False).
+            # Resolve is_error and extract result entities from the matching
+            # tool_result block.  Raw content is read once, entities extracted,
+            # then discarded — never stored on the Decision.
             result_block = tool_results.get(tool_use_id, {})
             is_error = bool(result_block.get("is_error", False))
+
+            # Extract redacted entities from the tool_result content.
+            result_content = result_block.get("content", "")
+            if isinstance(result_content, list):
+                # Content may be a list of text/image blocks — join text parts.
+                text_parts = [
+                    b.get("text", "")
+                    for b in result_content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                ]
+                result_content = " ".join(text_parts)
+            result_entities = extract_result_entities(str(result_content) if result_content else "")
+            # Raw result_content is not stored beyond this point.
 
             step_index = len(decisions)
             parent = step_index - 1 if step_index > 0 else None
@@ -250,6 +267,8 @@ def load_session(source: str) -> Run:
                     ts=ts,
                     tool_name=tool_name,
                     tool_args_summary=args_summary,
+                    targets=targets,
+                    result_entities=result_entities,
                     is_error=is_error,
                     parent_step_index=parent,
                 )
@@ -384,6 +403,7 @@ def read_session_from_spool(
             # args are already redacted by kairos_hook.py; one more pass is safe.
             raw_summary = summarize_args(tool_name, args)
             args_summary = redact(raw_summary)
+            targets = extract_targets(tool_name, args)
 
             is_error_raw = event.get("is_error")
             is_error = bool(is_error_raw) or name == "PostToolUseFailure"
@@ -397,6 +417,9 @@ def read_session_from_spool(
                     ts=event.get("occurred_at"),
                     tool_name=tool_name,
                     tool_args_summary=args_summary,
+                    targets=targets,
+                    # Spool doesn't carry tool_result content — no result_entities
+                    result_entities=[],
                     is_error=is_error,
                     parent_step_index=parent,
                 )
