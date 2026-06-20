@@ -103,6 +103,48 @@ def _step_line(dec: Decision, tag: str) -> str:
     return f"  #{dec.step_index:<4} {dec.tool_name:<14} {_step_summary(dec):<50}  {tag}"
 
 
+def _render_group(decisions: list[Decision], tag_fn) -> list[str]:
+    """Render a flagged group, collapsing identical (tool_name, summary) runs.
+
+    Entries sharing the same (tool_name, tool_args_summary) are collapsed into
+    one line:  #<first> ×<N>  <Tool>  <summary>  <tag>  (steps a,b,c +N more)
+
+    Non-identical entries render one line each (unchanged).
+    The collapse key uses tool_args_summary so only truly identical invocations
+    are merged; slight arg differences keep separate lines.
+    """
+    # Group consecutive-or-scattered identical invocations by key, preserving
+    # first-occurrence order for display.
+    from collections import OrderedDict
+    # key → (first_decision, [all_step_indices])
+    groups: dict[tuple[str, str], tuple[Decision, list[int]]] = OrderedDict()
+    for dec in decisions:
+        key = (dec.tool_name, dec.tool_args_summary or "")
+        if key not in groups:
+            groups[key] = (dec, [dec.step_index])
+        else:
+            groups[key][1].append(dec.step_index)
+
+    out: list[str] = []
+    for (tool, _summary), (first_dec, indices) in groups.items():
+        tag = tag_fn(first_dec)
+        if len(indices) == 1:
+            out.append(_step_line(first_dec, tag))
+        else:
+            # Collapsed line: show first index + ×N, then compact step list
+            shown = indices[:3]
+            extra = len(indices) - len(shown)
+            steps_str = ",".join(str(i) for i in shown)
+            if extra:
+                steps_str += f" +{extra} more"
+            summary_col = _trunc(_summary or " ".join(first_dec.targets), 48)
+            out.append(
+                f"  #{first_dec.step_index:<4} ×{len(indices):<3} "
+                f"{tool:<14} {summary_col:<50}  {tag}  (steps {steps_str})"
+            )
+    return out
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
@@ -176,11 +218,12 @@ def render_receipt(run: Run, *, color: bool = True) -> str:
                 _YELLOW, color,
             )
             lines.append(header)
-            for dec in autonomous:
-                tag = "autonomous"
+            def _auto_tag(dec: Decision) -> str:
+                t = "autonomous"
                 if dec.scope_drift:
-                    tag += " · scope-drift"
-                lines.append(_step_line(dec, tag))
+                    t += " · scope-drift"
+                return t
+            lines.extend(_render_group(autonomous, _auto_tag))
             lines.append("")
 
         # ── TOOL_INDUCED group ────────────────────────────────────────────────
@@ -190,10 +233,10 @@ def render_receipt(run: Run, *, color: bool = True) -> str:
                 _RED, color,
             )
             lines.append(header)
-            for dec in tool_induced:
+            def _ti_tag(dec: Decision) -> str:
                 why_short = _trunc(dec.why or "", 40)
-                tag = f"tool-induced · {why_short}" if why_short else "tool-induced"
-                lines.append(_step_line(dec, tag))
+                return f"tool-induced · {why_short}" if why_short else "tool-induced"
+            lines.extend(_render_group(tool_induced, _ti_tag))
             lines.append("")
 
         # ── Scope-drift-only group ────────────────────────────────────────────
@@ -203,10 +246,10 @@ def render_receipt(run: Run, *, color: bool = True) -> str:
                 _CYAN, color,
             )
             lines.append(header)
-            for dec in drift_only:
+            def _drift_tag(dec: Decision) -> str:
                 why_short = _trunc(dec.why or "", 40)
-                tag = f"scope-drift · {why_short}" if why_short else "scope-drift"
-                lines.append(_step_line(dec, tag))
+                return f"scope-drift · {why_short}" if why_short else "scope-drift"
+            lines.extend(_render_group(drift_only, _drift_tag))
             lines.append("")
 
         # ── Routine count line ────────────────────────────────────────────────

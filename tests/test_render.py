@@ -561,3 +561,123 @@ class TestUnanchoredNote:
         """F4.3: task_text None → also shows 'task not concrete' note."""
         receipt = _classified(None, [_dec(0, "Read", ["auth.py"])])
         assert "task not concrete" in receipt
+
+
+# ── F4.4: repeat-collapse in flagged groups ────────────────────────────────────
+
+
+class TestRepeatCollapse:
+    """Identical (tool_name, tool_args_summary) entries in a flag group collapse."""
+
+    def _curl_dec(self, step: int, summary: str = "curl https://service.example.com") -> Decision:
+        return Decision(
+            step_index=step,
+            ts=None,
+            tool_name="Bash",
+            tool_args_summary=summary,
+            targets=["curl", "https://service.example.com"],
+            result_entities=[],
+            is_error=False,
+            provenance="AUTONOMOUS",
+            scope_drift=False,
+            why="high-consequence action",
+        )
+
+    def test_7_identical_curls_collapse_to_1_line(self):
+        """7 identical curl AUTONOMOUS steps → single collapsed ×7 line."""
+        run = Run(
+            run_id="collapse-test",
+            source="test",
+            task_text=None,
+            decisions=[self._curl_dec(i) for i in range(7)],
+        )
+        # Pre-classify: provenance already set above
+        receipt = render_receipt(run, color=False)
+        # Only one line starting with "  #0" (collapsed), not 7 separate lines
+        step_lines = [l for l in receipt.splitlines() if l.strip().startswith("#")]
+        assert len(step_lines) == 1, (
+            f"Expected 1 collapsed line for 7 identical curls, got {len(step_lines)}: "
+            f"{step_lines}"
+        )
+        assert "×7" in receipt, f"Expected ×7 in receipt, got:\n{receipt}"
+
+    def test_collapsed_line_shows_step_indices(self):
+        """Collapsed line includes step indices like 'steps 0,1,2 +4 more'."""
+        run = Run(
+            run_id="collapse-idx",
+            source="test",
+            task_text=None,
+            decisions=[self._curl_dec(i) for i in range(7)],
+        )
+        receipt = render_receipt(run, color=False)
+        assert "steps" in receipt
+
+    def test_header_count_unchanged(self):
+        """Group header still shows true count (7), not collapsed count."""
+        run = Run(
+            run_id="collapse-hdr",
+            source="test",
+            task_text=None,
+            decisions=[self._curl_dec(i) for i in range(7)],
+        )
+        receipt = render_receipt(run, color=False)
+        assert "did WITHOUT being asked (7)" in receipt
+
+    def test_mixed_group_5_identical_2_distinct(self):
+        """5 identical + 2 distinct entries → 3 lines (1 collapsed + 2 distinct)."""
+        decs = [self._curl_dec(i) for i in range(5)]
+        # Two distinct entries with different summaries
+        for i, summary in enumerate(["git push origin main", "rm -rf dist/"], start=5):
+            decs.append(Decision(
+                step_index=i,
+                ts=None,
+                tool_name="Bash",
+                tool_args_summary=summary,
+                targets=summary.split(),
+                result_entities=[],
+                is_error=False,
+                provenance="AUTONOMOUS",
+                scope_drift=False,
+                why="high-consequence",
+            ))
+        run = Run(
+            run_id="mixed-group",
+            source="test",
+            task_text=None,
+            decisions=decs,
+        )
+        receipt = render_receipt(run, color=False)
+        step_lines = [l for l in receipt.splitlines() if l.strip().startswith("#")]
+        assert len(step_lines) == 3, (
+            f"Expected 3 lines (1 collapsed + 2 distinct), got {len(step_lines)}: "
+            f"{step_lines}"
+        )
+        assert "×5" in receipt
+
+    def test_all_distinct_no_collapse(self):
+        """All distinct entries → no ×N, each renders separately."""
+        decs = [
+            Decision(
+                step_index=i,
+                ts=None,
+                tool_name="Bash",
+                tool_args_summary=f"curl https://site{i}.example.com",
+                targets=["curl", f"https://site{i}.example.com"],
+                result_entities=[],
+                is_error=False,
+                provenance="AUTONOMOUS",
+                scope_drift=False,
+                why="high-consequence",
+            )
+            for i in range(3)
+        ]
+        run = Run(
+            run_id="no-collapse",
+            source="test",
+            task_text=None,
+            decisions=decs,
+        )
+        receipt = render_receipt(run, color=False)
+        assert "×" not in receipt
+        step_lines = [l for l in receipt.splitlines() if l.strip().startswith("#")]
+        assert len(step_lines) == 3

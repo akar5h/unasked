@@ -94,20 +94,31 @@ _DEFAULT_SPOOL_ROOT = Path.home() / ".kairos" / "spool"
 def _resolve_transcript(source: str) -> Path:
     """Return the Path to the transcript JSONL for ``source``.
 
-    If ``source`` looks like an existing file, return it directly.
-    Otherwise treat it as a session_id and search the CC projects tree.
+    Resolution order:
+    1. Existing file path — returned as-is.
+    2. Exact stem match: ``~/.claude/projects/**/<source>.jsonl``.
+    3. Prefix match (F4.4): ``~/.claude/projects/**/<source>*.jsonl``.
+       When multiple files match, the one with the most recent mtime wins.
+
+    Raises FileNotFoundError when no match is found at any step.
     """
     p = Path(source)
     if p.exists():
         return p
 
-    # Glob for the session file under ~/.claude/projects/.
-    matches = list(_PROJECTS_ROOT.glob(f"**/{source}.jsonl"))
-    if not matches:
+    # Exact stem match (full UUID).
+    exact = list(_PROJECTS_ROOT.glob(f"**/{source}.jsonl"))
+    if exact:
+        return exact[0]
+
+    # Prefix match — e.g. "986bc712" resolves "986bc712-4d6a-...jsonl".
+    prefix_matches = list(_PROJECTS_ROOT.glob(f"**/{source}*.jsonl"))
+    if not prefix_matches:
         raise FileNotFoundError(
             f"No transcript found for session {source!r} under {_PROJECTS_ROOT}"
         )
-    return matches[0]
+    # Newest by mtime wins on ties.
+    return max(prefix_matches, key=lambda p: p.stat().st_mtime)
 
 
 # ── Text extraction helper ────────────────────────────────────────────────────

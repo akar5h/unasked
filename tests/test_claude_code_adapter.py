@@ -539,3 +539,75 @@ class TestNoTaskRenderAndClassify:
         classify_run(run)
         receipt = render_receipt(run, color=False)
         assert "no explicit task detected" in receipt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F4.4: short-id / prefix resolution
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestPrefixResolution:
+    """_resolve_transcript falls back to prefix glob when exact stem not found."""
+
+    def _write_session(self, directory: Path, stem: str, ts: float = 0.0) -> Path:
+        """Write a minimal valid transcript file and set its mtime."""
+        import json, time
+        path = directory / f"{stem}.jsonl"
+        path.write_text(
+            json.dumps({
+                "type": "user",
+                "timestamp": "2026-06-18T08:00:00.000Z",
+                "message": {"role": "user", "content": "do something"},
+            }) + "\n"
+        )
+        # Set mtime so newest-wins logic is testable
+        import os
+        os.utime(path, (ts, ts))
+        return path
+
+    def test_exact_path_still_works(self, tmp_path):
+        """A full file path resolves directly (unchanged behaviour)."""
+        p = self._write_session(tmp_path, "full-uuid-session")
+        run = load_session(str(p))
+        assert run.run_id == "full-uuid-session"
+
+    def test_exact_stem_still_works(self, tmp_path, monkeypatch):
+        """Full UUID stem resolves via exact match (no prefix needed)."""
+        from unasked.adapters import claude_code as cc_mod
+        monkeypatch.setattr(cc_mod, "_PROJECTS_ROOT", tmp_path)
+        proj = tmp_path / "proj-dir"
+        proj.mkdir()
+        self._write_session(proj, "abc12345-0000-0000-0000-000000000000")
+        run = load_session("abc12345-0000-0000-0000-000000000000")
+        assert run.run_id == "abc12345-0000-0000-0000-000000000000"
+
+    def test_8char_prefix_resolves(self, tmp_path, monkeypatch):
+        """8-char prefix resolves to the matching full-UUID session file."""
+        from unasked.adapters import claude_code as cc_mod
+        monkeypatch.setattr(cc_mod, "_PROJECTS_ROOT", tmp_path)
+        proj = tmp_path / "proj-dir"
+        proj.mkdir()
+        self._write_session(proj, "deadbeef-cafe-0000-0000-000000000000")
+        run = load_session("deadbeef")
+        assert run.run_id == "deadbeef-cafe-0000-0000-000000000000"
+
+    def test_ambiguous_prefix_picks_newest(self, tmp_path, monkeypatch):
+        """When multiple files match the prefix, the newest by mtime wins."""
+        from unasked.adapters import claude_code as cc_mod
+        monkeypatch.setattr(cc_mod, "_PROJECTS_ROOT", tmp_path)
+        proj = tmp_path / "proj-dir"
+        proj.mkdir()
+        # older file
+        self._write_session(proj, "aabbcc11-0000-0000-0000-000000000000", ts=1000.0)
+        # newer file
+        self._write_session(proj, "aabbcc22-0000-0000-0000-000000000000", ts=9000.0)
+        run = load_session("aabbcc")
+        # should pick the newer one
+        assert run.run_id == "aabbcc22-0000-0000-0000-000000000000"
+
+    def test_unknown_prefix_raises(self, tmp_path, monkeypatch):
+        """An unrecognised prefix raises FileNotFoundError."""
+        from unasked.adapters import claude_code as cc_mod
+        monkeypatch.setattr(cc_mod, "_PROJECTS_ROOT", tmp_path)
+        with pytest.raises(FileNotFoundError):
+            load_session("ffffffff")
